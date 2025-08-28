@@ -35,7 +35,7 @@ if __name__ == "__main__":
 
     model = ColInternMTEB(
         base_model_id="OpenGVLab/InternVL3_5-1B-Instruct",
-        ckpt_path="outputs/colintern_epoch2/colintern_heads_epoch2.pt",
+        ckpt_path="outputs/colintern_heads_epoch1.pt",
     )
     
     print("model:", type(model).__name__,
@@ -45,6 +45,6 @@ if __name__ == "__main__":
     bench = get_benchmark("ViDoRe(v1)")
     MTEB(tasks=bench.tasks, verbosity=2).run(
         model,
-        output_folder="results/colintern_epoch2_vidore_v1",
+        output_folder="results",
         overwrite_results=True,
     )

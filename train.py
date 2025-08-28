@@ -173,11 +173,11 @@ class ImagePreprocessor:
             self.processor = AutoProcessor.from_pretrained(
                 model_id, trust_remote_code=True
             )
-            self.fallback = None
         except Exception:
             self.processor = None
+        # Try to set up a torchvision-based fallback regardless of processor availability
+        try:
             from torchvision import transforms as T
-
             self.fallback = T.Compose(
                 [
                     T.Resize(448, interpolation=T.InterpolationMode.BICUBIC),
@@ -185,30 +185,52 @@ class ImagePreprocessor:
                     T.ToTensor(),
                 ]
             )
+        except Exception:
+            self.fallback = None
 
     def load_pil(self, pil_list: List[Image.Image]) -> torch.Tensor:
         if self.processor is not None:
-            try:
-                batch = self.processor(images=pil_list, return_tensors="pt")
-            except Exception:
-                # Some processors (e.g., multimodal Instruct) require a text field; use empty prompts
+            # Prefer dedicated image processor to avoid routing through tokenizer
+            ip = getattr(self.processor, "image_processor", None) or getattr(
+                self.processor, "feature_extractor", None
+            )
+            if ip is not None:
+                batch = ip(images=pil_list, return_tensors="pt")
+            else:
+                # Fallback: try unified processor call with images-only
                 try:
-                    batch = self.processor(
-                        images=pil_list,
-                        text=[""] * len(pil_list),
-                        return_tensors="pt",
-                    )
+                    batch = self.processor(images=pil_list, return_tensors="pt")
                 except Exception:
-                    # Fall back to raw image processor/feature extractor if exposed
-                    ip = getattr(self.processor, "image_processor", None) or getattr(
-                        self.processor, "feature_extractor", None
-                    )
-                    if ip is None:
-                        raise
-                    batch = ip(images=pil_list, return_tensors="pt")
+                    # Last resort: torchvision/manual fallback
+                    if self.fallback is not None:
+                        px = torch.stack(
+                            [self.fallback(img.convert("RGB")) for img in pil_list]
+                        )
+                    else:
+                        # Manual PIL->Tensor conversion (HWC uint8 -> CHW float)
+                        import numpy as np
+
+                        arrays = [
+                            np.array(img.convert("RGB"), copy=False) for img in pil_list
+                        ]
+                        tensors = [
+                            torch.from_numpy(a).permute(2, 0, 1).float() / 255.0
+                            for a in arrays
+                        ]
+                        px = torch.stack(tensors)
+                    return px.to(self.device, dtype=self.dtype, non_blocking=True)
             px = batch["pixel_values"]
         else:
-            px = torch.stack([self.fallback(img.convert("RGB")) for img in pil_list])
+            if self.fallback is not None:
+                px = torch.stack([self.fallback(img.convert("RGB")) for img in pil_list])
+            else:
+                import numpy as np
+
+                arrays = [np.array(img.convert("RGB"), copy=False) for img in pil_list]
+                tensors = [
+                    torch.from_numpy(a).permute(2, 0, 1).float() / 255.0 for a in arrays
+                ]
+                px = torch.stack(tensors)
         return px.to(self.device, dtype=self.dtype, non_blocking=True)
 
 
@@ -665,14 +687,14 @@ def main():
     ap.add_argument("--train_hub", type=str, default=None)
     ap.add_argument("--train_jsonl", type=str, default=None)
     ap.add_argument("--root", type=str, default=".")
-    ap.add_argument("--out_dir", type=str, default="outputs/colintern")
+    ap.add_argument("--out_dir", type=str, default="outputs")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--num_workers", type=int, default=8)
     ap.add_argument("--prefetch_factor", type=int, default=6)
-    ap.add_argument("--save_every", type=int, default=2500)
+    ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument("--resume_ckpt", type=str, default=None)
     ap.add_argument("--compile_heads", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -687,7 +709,7 @@ def main():
     ap.add_argument(
         "--auto_target_frac",
         type=float,
-        default=0.9,
+        default=0.8,
         help="Target VRAM fraction to use (0-1)",
     )
     ap.add_argument(

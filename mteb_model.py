@@ -67,7 +67,7 @@ class ColInternMTEB(Encoder):
         self,
         *,
         base_model_id: str = "OpenGVLab/InternVL3_5-1B-Instruct",
-        ckpt_path: str = "outputs/colintern_epoch2/colintern_heads_epoch2.pt",
+        ckpt_path: str = "outputs/colintern_heads_step400.pt",
         device: str | None = None,
         torch_dtype: torch.dtype | None = None,
         similarity: str = "max_sim",  # or "cos_sim"
