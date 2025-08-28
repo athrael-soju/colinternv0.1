@@ -27,18 +27,52 @@ class ImagePreprocessor:
             self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         except Exception:
             self.processor = None
+        # Try to set up a torchvision-based fallback regardless of processor availability
+        try:
             from torchvision import transforms as T
             self.fallback = T.Compose([
                 T.Resize(448, interpolation=T.InterpolationMode.BICUBIC),
                 T.CenterCrop(448),
                 T.ToTensor(),
             ])
+        except Exception:
+            self.fallback = None
+
     def load_pil(self, pil_list):
-        if self.processor:
-            batch = self.processor(images=pil_list, return_tensors="pt")
-            px = batch["pixel_values"]
+        if self.processor is not None:
+            # Prefer dedicated image processor to avoid routing through tokenizer
+            ip = getattr(self.processor, "image_processor", None) or getattr(
+                self.processor, "feature_extractor", None
+            )
+            if ip is not None:
+                batch = ip(images=pil_list, return_tensors="pt")
+                px = batch["pixel_values"]
+            else:
+                # Fallback: try unified processor call with images-only
+                try:
+                    batch = self.processor(images=pil_list, return_tensors="pt")
+                    px = batch["pixel_values"]
+                except Exception:
+                    # Last resort: torchvision/manual fallback
+                    if self.fallback is not None:
+                        px = torch.stack([self.fallback(img.convert("RGB")) for img in pil_list])
+                    else:
+                        import numpy as np
+                        arrays = [np.array(img.convert("RGB"), copy=False) for img in pil_list]
+                        tensors = [
+                            torch.from_numpy(a).permute(2, 0, 1).float() / 255.0 for a in arrays
+                        ]
+                        px = torch.stack(tensors)
         else:
-            px = torch.stack([self.fallback(img.convert("RGB")) for img in pil_list])
+            if self.fallback is not None:
+                px = torch.stack([self.fallback(img.convert("RGB")) for img in pil_list])
+            else:
+                import numpy as np
+                arrays = [np.array(img.convert("RGB"), copy=False) for img in pil_list]
+                tensors = [
+                    torch.from_numpy(a).permute(2, 0, 1).float() / 255.0 for a in arrays
+                ]
+                px = torch.stack(tensors)
         return px.to(self.device, dtype=self.dtype)
 
 def load_model_and_heads(model_id, ckpt_path, device_map="cuda:0"):

@@ -8,6 +8,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from mteb.encoder_interface import Encoder
 from mteb.model_meta import ModelMeta
+import uuid
 
 # your training bits
 from train import ColIntern, ImagePreprocessor, safe_load_linear
@@ -76,7 +77,7 @@ class ColInternMTEB(Encoder):
     ):
         super().__init__()
         # Capabilities (set on instance so MTEB sees them)
-        self.name = "athrael-soju/colintern"
+        self.name = "colintern-v0.1"
         self.modalities = ["image", "text"]
         self.supported_modalities = ["image", "text"]
         self.similarity_fn_name = similarity
@@ -84,7 +85,7 @@ class ColInternMTEB(Encoder):
         if add_meta:
             self.mteb_model_meta = ModelMeta(
                 name="athrael-soju/colintern-v0.1",
-                revision="colintern_epoch2",
+                revision=uuid.uuid4(),
                 release_date="2025-08-27",
                 languages=["eng-Latn"],
                 modalities=["image", "text"],

@@ -7,4 +7,5 @@ pillow
 mteb[vision]
 bitsandbytes
 peft
+uuid
 faiss-gpu-cu12
