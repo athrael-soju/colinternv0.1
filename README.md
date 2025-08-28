@@ -1,33 +1,151 @@
-# ColIntern (InternVL3.5 + ColBERT-style late interaction)
+# ColIntern v0.1
 
-Minimal head-only trainer to reproduce a ColPali/ColQwen-like retriever on top of **InternVL3.5**.
+Lightweight training, hard-negative mining, and evaluation pipeline for ColPALI-style multi-vector retrieval built on InternVL. This repo provides:
 
----
+- Training heads (and optional LoRA) on top of an InternVL backbone (`train.py`)
+- Hard-negative mining using FAISS over Hugging Face datasets (`mine.py`)
+- MTEB evaluation on ViDoRe vision-document retrieval benchmark (`eval.py`)
 
-## Installation
+## Quick Start
+
+- Python 3.10+ recommended
+- NVIDIA GPU with CUDA 12.x recommended for training/mining speed
+- Windows is supported; CPU-only paths are available (slower)
+
 ```bash
-uv .venv
+# 1) Create and activate a virtual environment (Linux/WSL, bash)
+python -m venv .venv
 source .venv/bin/activate
+
+# 2) Install PyTorch first (choose your CUDA version from pytorch.org)
+# Example for CUDA 12.x on Linux/WSL:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# 3) Install project dependencies
+pip install -r requirements.txt
+
+# (WSL) Verify GPU is visible
+nvidia-smi
 ```
 
+Notes:
+
+- If FAISS GPU wheel is not available for your platform, you can still run mining on CPU via `--no_gpu`.
+- If bitsandbytes 8-bit optimizer fails on Windows, switch optimizer to `adamw`.
+
+### Using uv (fast Python package manager)
+
 ```bash
+# Install uv (Linux/WSL)
+curl -Ls https://astral.sh/uv/install.sh | sh
+
+# Create venv and install deps
+uv venv
+source .venv/bin/activate
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 uv pip install -r requirements.txt
+
+# Run scripts via uv (isolated, reproducible)
+uv run python train.py --help
+uv run python mine.py --help
+uv run python eval.py
 ```
 
-Then
+### Flash Attention (optional)
+
+Flash-Attn can speed up attention-heavy models. Support depends on your OS, CUDA and PyTorch builds.
+
+Install (Linux/WSL recommended):
 
 ```bash
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 
-uv pip install flash-attn --no-build-isolation
+# Ensure you installed a CUDA-enabled torch first (see above)
+python -c "import torch; print(torch.version.cuda)"  # should print a CUDA version
+
+# Then install flash-attn matching your CUDA/Torch toolchain
+pip install flash-attn --no-build-isolation
+# (If build fails, try a version pin, e.g.)
+# pip install flash-attn==2.6.3 --no-build-isolation
+
+# Verify
+python -c "import flash_attn; print('flash-attn OK')"
 ```
 
-> Tip (Windows WSL): ensure your NVIDIA driver + CUDA toolkit matches your PyTorch build.
+Notes:
+- Windows native builds are often unsupported; use WSL2 Ubuntu or Linux for best results.
+- If flash-attn is installed, enable it by passing `--use_flash_attn` to `train.py`.
+- If unavailable, simply omit `--use_flash_attn`; training will fall back to standard attention.
 
----
+## Project Structure
 
-## End-to-End Workflow
+- `train.py` — trains projection heads (and optional LoRA adapters) for image/text.
+- `mine.py` — builds a FAISS index over a dataset and mines hard negatives into JSONL.
+- `eval.py` — runs MTEB ViDoRe evaluation using the trained heads.
+- `mteb_model.py` — MTEB-compatible wrapper around the model.
+- `requirements.txt` — dependencies (Transformers, datasets, MTEB, FAISS, etc.).
 
-### 1) Train Epoch 1 (in-batch negatives)
+Outputs:
+
+- Training: `outputs/train/colintern_heads_*.pt` and `training_loss.txt`
+- Mining: `outputs/mine/mined_triples.jsonl`
+- Evaluation: `outputs/eval/` (MTEB results)
+
+## Data Formats
+
+Two ways to train:
+
+1) Triples JSONL (local or HF-backed IDs):
+   Each line in `--train_jsonl` must be a JSON object with:
+
+```json
+{"query": "...", "pos": "path/or/hf_id.png", "negs": ["neg1.png", "neg2.png"]}
+```
+
+- `pos`/`negs` can be absolute/relative image paths.
+- Or HF identifiers of the form: `hub_name/split/doc_<idx>.png` (e.g., `vidore/colpali_train_set/train/doc_123.png`).
+- If using relative paths, set `--root` to prepend a directory.
+
+2) Hugging Face dataset (in-batch training):
+
+- Pass `--train_hub <dataset_name>` where samples have columns: `query` (str) and `image` (PIL or image-like).
+
+## Training
+
+Minimal example using a HF dataset (ViDoRe ColPALI training set):
+
+```bash
+python train.py \
+  --model_id OpenGVLab/InternVL3_5-4B \
+  --train_hub vidore/colpali_train_set \
+  --out_dir outputs/train \
+  --epochs 1 --batch_size 8 --grad_accum 4 --lr 5e-5
+```
+
+Training from mined triples JSONL:
+
+```bash
+python train.py \
+  --model_id OpenGVLab/InternVL3_5-4B \
+  --train_jsonl outputs/mine/mined_triples.jsonl \
+  --root . \
+  --out_dir outputs/train \
+  --epochs 1 --batch_size 8 --grad_accum 4 --lr 5e-5
+```
+
+Useful flags:
+
+- `--device_map cuda:0` select GPU (default tries CUDA if available)
+- `--use_flash_attn` enable flash attention when supported
+- `--auto_batch` auto-tune batch size to a target VRAM fraction (`--auto_target_frac`, `--auto_max_batch`)
+- `--compile_heads` compile linear heads with `torch.compile` if available
+- `--optimizer adamw|paged_adamw_8bit` choose optimizer (8-bit requires bitsandbytes)
+- LoRA fine-tuning of the language model: `--lora --lora_r 32 --lora_alpha 32 --lora_dropout 0.1`
+- Resume heads/adapters: `--resume_ckpt outputs/train/colintern_heads_epoch1.pt`
+
+Checkpoints are saved continuously as `outputs/train/colintern_heads_{tag}.pt`.
+
+### Optimized run example
+
+A balanced configuration for a mid-size GPU (e.g., ~24 GB), leveraging auto-batch, LoRA, bitsandbytes and flash attention:
 
 ```bash
 python train.py \
@@ -46,24 +164,17 @@ python train.py \
   --lora_alpha 32 \
   --lora_dropout 0.1 \
   --optimizer paged_adamw_8bit \
-  --use_flash_attn \
-  --save_every 50
+  --use_flash_attn
 ```
 
-This uses in-batch negatives only.
-At the end you will have:
+Notes:
 
-```
-outputs/train/colintern_heads_epoch1.pt
-```
+- `--optimizer paged_adamw_8bit` requires bitsandbytes; if unavailable on your platform, switch to `--optimizer adamw`.
+- Flash attention support depends on your PyTorch/CUDA stack and the underlying model implementation.
 
-and also step snapshots like `outputs/train/colintern_heads_step400.pt` (because `--save_every 400`).
+## Mining Hard Negatives
 
----
-
-### 2) Mine Hard Negatives (after Epoch 1)
-
-Use the miner to create a JSONL triples file containing hard negatives:
+Use the trained heads to mine hard negatives from a HF dataset (default: `vidore/colpali_train_set`):
 
 ```bash
 python mine.py \
@@ -72,258 +183,59 @@ python mine.py \
   --hub_name vidore/colpali_train_set \
   --split train \
   --out_jsonl outputs/mine/mined_triples.jsonl \
-  --k 20 --doc_batch 16 --query_batch 64
+  --k 20 \
+  --doc_batch 16 \
+  --query_batch 64
 ```
 
-Output example (one line per query):
+GPU vs CPU FAISS:
 
-```json
-{"query": "...", "pos": "vidore/colpali_train_set/train/doc_42.png", "negs": ["vidore/colpali_train_set/train/doc_73.png", "..."]}
-```
+- GPU (faster): requires FAISS GPU and CUDA. Default behavior picks GPU if available.
+- CPU: add `--no_gpu` to force CPU index.
 
-> These are **HF pseudo-paths**, not files. The training script now **resolves them automatically** back to dataset items.
+Debug with a subset: add `--limit N` to encode/search the first N items only.
 
----
+The mined JSONL format is compatible with `train.py --train_jsonl`.
 
-### 3) Train Epoch 2+ (with mined hard negatives)
+## Evaluation (MTEB ViDoRe)
+
+`eval.py` runs MTEB ViDoRe with the MTEB wrapper in `mteb_model.py`:
 
 ```bash
-python train.py \
-  --model_id OpenGVLab/InternVL3_5-1B-Instruct \
-  --train_jsonl outputs/mine/mined_triples.jsonl \
-  --out_dir outputs/train \
-  --resume_ckpt outputs/train/colintern_heads_epoch1.pt \
-  --batch_size 8 --grad_accum 4 \
-  --num_workers 8 --prefetch_factor 6 \
-  --save_every 2500 --compile_heads --device_map cuda:0
+python eval.py
 ```
 
-Notes:
+Defaults in `eval.py`:
 
-- `--train_jsonl` points to the mined triples.
-- `--resume_ckpt` loads the projection heads from epoch 1.
-- The trainer caches document encodings; HF IDs are resolved to images on-the-fly.
+- Base model: `OpenGVLab/InternVL3_5-1B-Instruct`
+- Heads checkpoint: `outputs/train/colintern_heads_epoch1.pt`
+- Benchmark: `ViDoRe(v1)`
+- Results written to: `outputs/eval/`
 
----
+Adjust the defaults by editing `eval.py` or by creating your own small launcher that instantiates `ColInternMTEB` with different args.
 
-### 4) Evaluate via MTEB (ViDoRe) — Recommended
+Windows/WSL notes:
 
-We provide an MTEB-compatible wrapper in `eval.py` that runs ViDoRe through MTEB.
-This is the preferred path going forward.
+- `eval.py` sets TMPDIR/TEMP to a local `torch_tmp/` and uses file-backed sharing to avoid `/dev/shm` limits.
+- It also limits thread counts for stability on Windows.
 
+## Recommended End-to-End Workflow
 
-1) List available benchmark names in your installed MTEB (to avoid KeyError):
+1) Install dependencies (see Quick Start).
+2) Optional: initial training on `vidore/colpali_train_set` with `train.py --train_hub` to get a first checkpoint.
+3) Mining: run `mine.py` over the same or a broader dataset to produce `outputs/mine/mined_triples.jsonl` of hard negatives.
+4) Fine-tune: run `train.py --train_jsonl outputs/mine/mined_triples.jsonl` to refine the heads (and optionally LoRA).
+5) Evaluate: run `eval.py` to produce MTEB ViDoRe results under `outputs/eval/`.
 
-```bash
-python -c "from mteb.benchmarks.get_benchmark import BENCHMARK_REGISTRY; print('\n'.join(sorted(BENCHMARK_REGISTRY.keys())))"
-python -c "from mteb.benchmarks.get_benchmark import BENCHMARK_REGISTRY; print('\n'.join([k for k in BENCHMARK_REGISTRY if 'vidore' in k.lower()]))"
-```
+## Tips & Troubleshooting
 
-This prints the canonical names (they may be like `ViDoRe(v2)`/`ViDoRe(v1)`).
+- Out of memory during training: enable `--auto_batch`, reduce `--batch_size`, or increase `--grad_accum`.
+- Slow mining on CPU: try FAISS GPU (ensure CUDA + matching FAISS wheel); otherwise increase `--doc_batch/--query_batch` within RAM limits.
+- bitsandbytes issues on Windows: use `--optimizer adamw`.
+- Missing `datasets` package: required when using `--train_hub` or HF IDs in JSONL.
 
-2) Run evaluation (replace names with what your registry shows):
+## Citations & References
 
-```bash
-# Example (eval.py writes to outputs/eval/ and reads ckpt from outputs/train/)
-python -u eval.py
-```
-
-Results are saved under `outputs/eval/` (created automatically by `eval.py`).
-
-Troubleshooting:
-
-- **KeyError on benchmark name:** Your MTEB version uses different names. Re-run the list commands above and use those exact names. If none are found, upgrade MTEB: `pip install -U mteb`.
-- TF32/FlashAttention warnings are safe to ignore.
-
----
-
----
-
-## JSONL Triples Format (custom datasets)
-
-If you want to train on local images instead of HF datasets:
-
-```json
-{"query":"When is the deadline?","pos":"data/pages/timeline.png","negs":["data/pages/intro.png","data/pages/appendix.png"]}
-```
-
-Run:
-
-```bash
-python train.py \
-  --model_id OpenGVLab/InternVL3_5-1B-Instruct \
-  --train_jsonl /path/to/train.jsonl \
-  --root /path/to \
-  --out_dir ./outputs/colintern \
-  --batch_size 4 --grad_accum 8 --epochs 1 --lr 5e-5 \
-  --num_workers 8 --prefetch_factor 6 \
-  --save_every 2500 --device_map cuda:0
-```
-
----
-
-## Checkpointing & Resume
-
-- Snapshots are saved every **N steps** (default `--save_every 2500`) and at **epoch end**.
-- Resume from a snapshot:
-
-```bash
-python train.py ... --resume_ckpt ./outputs/colintern/colintern_heads_step25000.pt
-```
-
----
-
-## Files in this repo
-
-- `train.py` — head-only trainer (HF datasets via `--train_hub` or local JSONL via `--train_jsonl`)
-- `mine.py` — mines hard negatives from an HF dataset using a trained checkpoint
-- `eval.py` — MTEB-based ViDoRe evaluation runner
-- `mteb_model.py` — model wrapper used by the evaluator
-- `requirements.txt` — dependencies
-
----
-
-## Tips to beat ColQwen2.5-v0.2 on ViDoRe V2
-
-- Finish epoch 1 (you should see loss ~0.5–0.6).
-- Mine **K=20–50** hard negatives per query; train 1–2 more epochs.
-- Ensure dynamic tiling via the model `AutoProcessor` path (already handled by the script).
-- Evaluate frequently on ViDoRe subsamples to track NDCG/Recall gains.
-
----
-
-## Plotting
-
-- **Loss curve:**
-
-  ```bash
-  python plot_training_loss.py \
-    --input outputs/train/training_loss.txt \
-    --output outputs/training_loss.png \
-    --smooth 200
-  ```
-- **ViDoRe metrics across runs:**
-
-  ```bash
-  python plot_vidore_metrics.py \
-    --inputs outputs/eval_v1.json outputs/eval_v2.json \
-    --labels "E1 (in-batch)" "E2 (mined)" \
-    --outdir outputs/plots
-  ```
-
----
-
-## Troubleshooting
-
-- **CUDA OOM:** lower `--batch_size` and/or raise `--grad_accum`. Consider enabling `--auto_batch` once supported across modes.
-- **Slow dataloading:** keep `--num_workers 8` and `--prefetch_factor 6` (tune per CPU/SSD).
-- **FAISS GPU not found:** ensure `faiss-gpu` matches your CUDA, or build FAISS as below.
-- **Tokenizer/weights download issues:** set `HF_HOME` to a fast disk and ensure internet access; `pip install datasets` is required for HF sets.
-
----
-
-## Known limitations
-
-- Requires internet access for HF datasets when using `--train_hub`.
-- FAISS-GPU is optional but strongly recommended for fast mining.
-- Benchmark names in MTEB can differ by version; list them before running.
-
----
-
-To use FAISS-GPU in WSL, you must install the toolkit first:
-
-```bash
-wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-wsl-ubuntu.pin
-sudo mv cuda-wsl-ubuntu.pin /etc/apt/preferences.d/cuda-repository-pin-600
-wget https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda-repo-wsl-ubuntu-13-0-local_13.0.0-1_amd64.deb
-sudo dpkg -i cuda-repo-wsl-ubuntu-13-0-local_13.0.0-1_amd64.deb
-sudo cp /var/cuda-repo-wsl-ubuntu-13-0-local/cuda-*-keyring.gpg /usr/share/keyrings/
-sudo apt-get update
-sudo apt-get -y install cuda-toolkit-13-0
-```
-
-Then
-
-1) Install build deps for Python bindings
-   sudo apt-get update
-   sudo apt-get install -y swig python3-dev python3-venv python3-pip
-
-# (optional but helpful)
-
-sudo apt-get install -y ninja-build libopenblas-dev libomp-dev
-
-Inside your venv (the one you’ll use to import faiss):
-
-python -m pip install --upgrade pip
-python -m pip install numpy
-
-CMake finds NumPy headers via your active Python. Make sure you run CMake from the same shell where your venv is activated.
-
-2) Confirm your compute capability and set CUDA arch
-   python - << 'PY'
-   import torch
-   print("capability:", torch.cuda.get_device_capability(0))
-   PY
-
-If it prints (12, 0), use CUDA_ARCH=120 (if (9, 0), then 90, etc.):
-
-export CUDACXX=/usr/local/cuda/bin/nvcc
-export CUDA_ARCH=120    # set from the value above
-
-3) Configure again (OpenBLAS + GPU + Python via SWIG)
-
-From the FAISS repo root:
-
-rm -rf build
-cmake -S . -B build 
-  -G Ninja 
-  -DFAISS_ENABLE_GPU=ON 
-  -DFAISS_ENABLE_PYTHON=ON 
-  -DBUILD_TESTING=OFF 
-  -DFAISS_OPT_LEVEL=avx2 
-  -DCMAKE_BUILD_TYPE=Release 
-  -DCMAKE_CUDA_COMPILER="${CUDACXX}" 
-  -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} 
-  -DBLA_VENDOR=OpenBLAS 
-  -DFAISS_BLAS_LIBRARIES=/usr/lib/x86_64-linux-gnu/libopenblas.so
-
-Build + install
-
-# from the faiss repo root
-
-cmake --build build -j          # uses Ninja (fast)
-
-# install the Python bindings produced by the build
-
-uv pip install ./build/faiss/python
-
-Quick GPU sanity test
-python - << 'PY'
-import faiss, numpy as np
-print("FAISS:", faiss.__version__)
-print("GPUs:", faiss.get_num_gpus())
-d=128
-x = np.random.randn(10000, d).astype('float32')
-faiss.normalize_L2(x)
-res = faiss.StandardGpuResources()
-index = faiss.GpuIndexFlatIP(res, d)
-index.add(x)
-D,I = index.search(x[:5], 5)
-print("OK:", D.shape, I.shape)
-PY
-
-should show:
-
-```
-FAISS: 1.12.0
-GPUs: 1
-OK: (5, 5) (5, 5)
-```
-
-cd ../
-python mine_hard_negatives.py 
-  --model_id OpenGVLab/InternVL3_5-1B-Instruct 
-  --ckpt outputs/train/colintern_heads_epoch1.pt 
-  --hub_name vidore/colpali_train_set --split train 
-  --out_jsonl outputs/mine/mined_triples.jsonl 
-  --k 20 --doc_batch 16 --query_batch 64
+- InternVL: https://huggingface.co/OpenGVLab
+- ColPALI/ColBERT-style max-sim: https://github.com/illuin-tech/colpali
+- MTEB: https://github.com/embeddings-benchmark/mteb
