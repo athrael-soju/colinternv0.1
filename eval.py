@@ -34,7 +34,7 @@ if __name__ == "__main__":
         pass
 
     model = ColInternMTEB(
-        base_model_id="OpenGVLab/InternVL3_5-4B",
+        base_model_id="OpenGVLab/InternVL3_5-1B-Instruct",
         ckpt_path="outputs/colintern_epoch2/colintern_heads_epoch2.pt",
     )
     

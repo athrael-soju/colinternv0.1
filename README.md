@@ -10,6 +10,12 @@ Minimal head-only trainer to reproduce a ColPali/ColQwen-like retriever on top o
 pip install -r requirements.txt
 ```
 
+Then 
+
+```bash
+pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu129
+```
+
 > Tip (Windows WSL): ensure your NVIDIA driver + CUDA toolkit matches your PyTorch build.
 
 ---
@@ -45,14 +51,16 @@ These are HF pseudo-paths; the trainer auto-resolves them back to dataset items.
 ### 1) Train Epoch 1 (in-batch negatives)
 
 ```bash
-python train_colintern.py \
-  --model_id OpenGVLab/InternVL3_5-4B \
-  --train_jsonl ./outputs/colintern/bootstrap_train.jsonl \
-  --out_dir ./outputs/colintern \
+python train.py \
+  --model_id OpenGVLab/InternVL3_5-1B-Instruct \
+  --train_hub vidore/colpali_train_set \
+  --out_dir ./outputs/colintern_1b_instruct_lora \
   --batch_size 4 --grad_accum 8 --epochs 1 --lr 5e-5 \
-  --num_workers 8 --prefetch_factor 6 \
-  --save_every 2500 --compile_heads --device_map cuda:0
+  --device_map cuda:0 \
+  --lora --lora_r 32 --lora_alpha 32 --lora_dropout 0.1 \
+  --optimizer paged_adamw_8bit
 ```
+
 This uses in-batch negatives only.  
 At the end you will have:
 ```
@@ -69,7 +77,7 @@ and also step snapshots like `colintern_heads_step2500.pt` (because `--save_ever
 Use the miner to create a JSONL triples file containing hard negatives:
 ```bash
 python mine_hard_negatives.py \
-  --model_id OpenGVLab/InternVL3_5-4B \
+  --model_id OpenGVLab/InternVL3_5-1B-Instruct \
   --ckpt ./outputs/colintern/colintern_heads_epoch1.pt \
   --hub_name vidore/colpali_train_set \
   --split train \
@@ -87,8 +95,8 @@ Output example (one line per query):
 ### 3) Train Epoch 2+ (with mined hard negatives)
 
 ```bash
-python train_colintern.py \
-  --model_id OpenGVLab/InternVL3_5-4B \
+python train.py \
+  --model_id OpenGVLab/InternVL3_5-1B-Instruct \
   --train_jsonl ./outputs/colintern/mined_triples.jsonl \
   --out_dir ./outputs/colintern \
   --resume_ckpt ./outputs/colintern/colintern_heads_epoch1.pt \
@@ -155,7 +163,7 @@ If you want to train on local images instead of HF datasets:
 Run:
 ```bash
 python train_colintern.py \
-  --model_id OpenGVLab/InternVL3_5-4B \
+  --model_id OpenGVLab/InternVL3_5-1B-Instruct \
   --train_jsonl /path/to/train.jsonl \
   --root /path/to \
   --out_dir ./outputs/colintern \
@@ -332,7 +340,7 @@ OK: (5, 5) (5, 5)
 
 cd ../
 python mine_hard_negatives.py \
-  --model_id OpenGVLab/InternVL3_5-4B \
+  --model_id OpenGVLab/InternVL3_5-1B-Instruct \
   --ckpt ./outputs/colintern/colintern_heads_epoch1.pt \
   --hub_name vidore/colpali_train_set --split train \
   --out_jsonl ./outputs/colintern/mined_triples.jsonl \

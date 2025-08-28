@@ -77,7 +77,7 @@ def encode_queries_batch(backbone, tokenizer, proj_txt, texts):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model_id", type=str, default="OpenGVLab/InternVL3_5-4B")
+    ap.add_argument("--model_id", type=str, default="OpenGVLab/InternVL3_5-1B-Instruct")
     ap.add_argument("--ckpt", type=str, required=True, help="projection heads checkpoint .pt")
     ap.add_argument("--hub_name", type=str, default="vidore/colpali_train_set")
     ap.add_argument("--split", type=str, default="train")

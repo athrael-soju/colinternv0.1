@@ -66,7 +66,7 @@ class ColInternMTEB(Encoder):
     def __init__(
         self,
         *,
-        base_model_id: str = "OpenGVLab/InternVL3_5-4B",
+        base_model_id: str = "OpenGVLab/InternVL3_5-1B-Instruct",
         ckpt_path: str = "outputs/colintern_epoch2/colintern_heads_epoch2.pt",
         device: str | None = None,
         torch_dtype: torch.dtype | None = None,
@@ -99,7 +99,7 @@ class ColInternMTEB(Encoder):
                 open_weights=True,
                 public_training_code="https://github.com/illuin-tech/colpali",
                 public_training_data="https://huggingface.co/datasets/vidore/colpali_train_set",
-                reference="https://huggingface.co/OpenGVLab/InternVL3_5-4B",
+                reference="https://huggingface.co/OpenGVLab/InternVL3_5-1B-Instruct",
                 training_datasets=COLPALI_TRAINING_DATA,
             )
 

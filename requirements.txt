@@ -4,7 +4,7 @@ timm
 accelerate
 datasets
 pillow
-tqdm
 faiss-gpu-cu12
-matplotlib
 mteb[vision]
+bitsandbytes
+peft

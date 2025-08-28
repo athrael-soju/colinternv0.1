@@ -32,11 +32,31 @@ except Exception:
 
 from transformers import AutoTokenizer, AutoModel, AutoProcessor
 
+# Optional: PEFT / LoRA
+try:
+    from peft import (
+        LoraConfig,
+        get_peft_model,
+        get_peft_model_state_dict,
+        set_peft_model_state_dict,
+    )
+
+    HAS_PEFT = True
+except Exception:
+    HAS_PEFT = False
+
+# Optional: bitsandbytes (for paged_adamw_8bit)
+try:
+    import bitsandbytes as bnb  # noqa: F401
+
+    HAS_BNB = True
+except Exception:
+    HAS_BNB = False
+
+
 # -----------------------------
 # Utils
 # -----------------------------
-
-
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -185,6 +205,11 @@ class ColIntern(nn.Module):
         proj_dim: int = 128,
         use_flash_attn: bool = False,
         device_map: str = "auto",
+        lora: bool = False,
+        lora_r: int = 32,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.1,
+        lora_targets: Optional[List[str]] = None,
     ):
         super().__init__()
         self.model_id = model_id
@@ -199,14 +224,57 @@ class ColIntern(nn.Module):
             use_flash_attn=use_flash_attn,
             device_map=device_map,
         ).eval()
+
+        # Freeze everything by default
         for p in self.backbone.parameters():
             p.requires_grad_(False)
 
-        hidden = self.backbone.config.llm_config.hidden_size
-        self.proj_dim = proj_dim
-        self.proj_img = nn.Linear(hidden, proj_dim, bias=False).to(self.device)
-        self.proj_txt = nn.Linear(hidden, proj_dim, bias=False).to(self.device)
+        # Optional LoRA on the LLM part (InternVL uses a Llama language model at .language_model)
+        self.lora_enabled = bool(lora and HAS_PEFT)
+        self.lora_config = None
+        if self.lora_enabled:
+            # sensible defaults for Llama blocks
+            targets = lora_targets or [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
+            self.lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=targets,
+            )
+            # Insert adapters into the language model module
+            lm = self.backbone.language_model
+            lm = get_peft_model(lm, self.lora_config)
+            self.backbone.language_model = lm
+            self.backbone.language_model.train()  # adapters will be trainable
 
+    hidden = (
+        getattr(getattr(self.backbone.config, "llm_config", None), "hidden_size", None)
+        or getattr(
+            getattr(self.backbone, "language_model", None),
+            "config",
+            type("x", (), {})(),
+        ).__dict__.get("hidden_size", None)
+        or getattr(self.backbone.config, "hidden_size", None)
+    )
+    if hidden is None:
+        raise AttributeError(
+            "Could not infer hidden_size from backbone; please set manually."
+        )
+    self.proj_dim = proj_dim
+    self.proj_img = nn.Linear(hidden, proj_dim, bias=False).to(self.device)
+    self.proj_txt = nn.Linear(hidden, proj_dim, bias=False).to(self.device)
+
+    # ---- token extractors ----
     def image_tokens(self, pixel_values: torch.Tensor) -> torch.Tensor:
         feats = self.backbone.extract_feature(pixel_values)
         return feats.float()
@@ -219,13 +287,17 @@ class ColIntern(nn.Module):
         out = self.backbone.language_model(**toks, output_hidden_states=True)
         return out.hidden_states[-1].float()
 
+    # ---- normalized multi-vectors ----
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         h = self.image_tokens(pixel_values).detach()
         z = self.proj_img(h)
         return l2norm(z)
 
     def encode_texts(self, texts: List[str]) -> torch.Tensor:
-        h = self.text_tokens(texts).detach()
+        h = self.text_tokens(texts)
+        # if LoRA is enabled we *do* want grads through LLM; but we still freeze base weights:
+        if not self.lora_enabled:
+            h = h.detach()
         z = self.proj_txt(h)
         return l2norm(z)
 
@@ -235,6 +307,11 @@ class ColIntern(nn.Module):
 # -----------------------------
 def collate_hf(batch):
     return [b["query"] for b in batch], [b["image"] for b in batch]
+
+
+def _pair_score(qi: torch.Tensor, dj: torch.Tensor) -> torch.Tensor:
+    # qi: [Lq, D], dj: [Ld, D] -> scalar
+    return torch.max(qi @ dj.T, dim=1).values.sum()
 
 
 def score_query_vs_docs(
@@ -264,6 +341,7 @@ class Trainer:
         save_every: int = 2500,
         seed: int = 42,
         loss_log_path: Optional[str] = None,
+        optimizer_name: str = "adamw",
     ):
         self.model = model
         self.image_prep = image_prep
@@ -280,11 +358,24 @@ class Trainer:
         self.loss_log_path = loss_log_path or str(Path(out_dir) / "training_loss.txt")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.optimizer = torch.optim.AdamW(
-            list(self.model.proj_img.parameters())
-            + list(self.model.proj_txt.parameters()),
-            lr=self.lr,
+        # Build optimizer params: heads + (optional) LoRA adapter params
+        params = list(self.model.proj_img.parameters()) + list(
+            self.model.proj_txt.parameters()
         )
+        if self.model.lora_enabled:
+            # only LoRA adapter parameters (they have names like *.lora_A, *.lora_B)
+            peft_params = [
+                p
+                for n, p in self.model.backbone.language_model.named_parameters()
+                if p.requires_grad and ("lora_" in n)
+            ]
+            params += peft_params
+
+        if optimizer_name == "paged_adamw_8bit" and HAS_BNB:
+            self.optimizer = bnb.optim.PagedAdamW8bit(params, lr=self.lr)
+        else:
+            self.optimizer = torch.optim.AdamW(params, lr=self.lr)
+
         self.step = 0
         self.doc_cache: Dict[str, torch.Tensor] = {}
         self._hf_ds_cache: Dict[Tuple[str, str], Any] = {}
@@ -318,7 +409,6 @@ class Trainer:
 
         while bs <= max_bs:
             try:
-                # re-make tensors for this size
                 q_texts = q_texts[:bs] + ["x"] * max(0, bs - len(q_texts))
                 px = self.image_prep.load_pil([dummy] * bs)
                 with torch.amp.autocast(
@@ -398,9 +488,13 @@ class Trainer:
         scaler = torch.amp.GradScaler(
             "cuda", enabled=(not bf16_supported()) and torch.cuda.is_available()
         )
+
+        # Heads always train; backbone: only LoRA adapters (if any)
         self.model.proj_img.train()
         self.model.proj_txt.train()
-        self.model.backbone.eval()
+        if self.model.lora_enabled:
+            self.model.backbone.language_model.train()
+        self.model.backbone.eval()  # safe; PEFT adapters inside lm are trainable
 
         for epoch in range(self.epochs):
             epoch_loss = 0.0
@@ -457,6 +551,68 @@ class Trainer:
             neg_paths.append(item.get("negs", []))
         return queries, pos_paths, neg_paths
 
+    def train_hf_inbatch(self, hf_set: HFColpaliDataset):
+        set_seed(self.seed)
+        loader = self._make_loader(hf_set, collate_hf)
+
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=(not bf16_supported()) and torch.cuda.is_available()
+        )
+
+        # Train heads; if LoRA, train adapters; keep frozen base
+        self.model.proj_img.train()
+        self.model.proj_txt.train()
+        if self.model.lora_enabled:
+            self.model.backbone.language_model.train()
+        self.model.backbone.eval()
+
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            for it, (queries, pil_images) in enumerate(loader):
+                px = self.image_prep.load_pil(pil_images)  # [B, C, H, W]
+
+                with torch.amp.autocast(
+                    "cuda", enabled=(not bf16_supported()) and torch.cuda.is_available()
+                ):
+                    q_tokens = self.model.encode_texts(list(queries))  # [B, Lq, D]
+                    d_tokens = self.model.encode_images(px)  # [B, Ld, D]
+
+                    # logits[i, j] = score(query_i, doc_j)
+                    B = q_tokens.size(0)
+                    logits = []
+                    for i in range(B):
+                        qi = q_tokens[i]
+                        row = []
+                        for j in range(B):
+                            dj = d_tokens[j]
+                            row.append(_pair_score(qi, dj))
+                        logits.append(torch.stack(row))
+                    logits = torch.stack(logits)  # [B, B]
+                    labels = torch.arange(B, device=logits.device)
+                    loss = torch.nn.functional.cross_entropy(logits, labels)
+
+                epoch_loss += float(loss.detach().cpu())
+
+                scaler.scale(loss).backward()
+                if (it + 1) % self.grad_accum == 0:
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.step += 1
+                    if self.step % self.save_every == 0:
+                        self.save_ckpt(tag=f"step{self.step}")
+
+                if (it + 1) % 50 == 0:
+                    avg = epoch_loss / (it + 1)
+                    self._log(
+                        f"[hf] Epoch {epoch+1} iter {it+1}/{len(loader)} - loss {avg:.4f}"
+                    )
+
+            self._log(
+                f"[hf] Epoch {epoch+1} done. avg loss = {epoch_loss / max(1,len(loader)):.4f}"
+            )
+            self.save_ckpt(tag=f"epoch{epoch+1}")
+
     def save_ckpt(self, tag: str = "latest"):
         ckpt = {
             "proj_img": safe_state_dict(self.model.proj_img),
@@ -465,7 +621,18 @@ class Trainer:
             "model_id": self.model.model_id,
             "dtype": str(self.model.dtype),
             "step": self.step,
+            "lora_enabled": self.model.lora_enabled,
         }
+        if self.model.lora_enabled:
+            # Save LoRA adapter weights of the language model
+            lm = self.model.backbone.language_model
+            ckpt["lora_state"] = get_peft_model_state_dict(lm)
+            ckpt["lora_config"] = {
+                "r": self.model.lora_config.r,
+                "alpha": self.model.lora_config.lora_alpha,
+                "dropout": self.model.lora_config.lora_dropout,
+                "targets": self.model.lora_config.target_modules,
+            }
         path = self.out_dir / f"colintern_heads_{tag}.pt"
         torch.save(ckpt, path)
         print(f"[saved] {path}")
@@ -511,6 +678,17 @@ def main():
         default=64,
         help="Upper bound when searching for batch size",
     )
+    # LoRA options
+    ap.add_argument(
+        "--lora", action="store_true", help="Enable LoRA adapters on the language model"
+    )
+    ap.add_argument("--lora_r", type=int, default=32)
+    ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--lora_dropout", type=float, default=0.1)
+    # Optimizer
+    ap.add_argument(
+        "--optimizer", type=str, default="adamw", choices=["adamw", "paged_adamw_8bit"]
+    )
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -521,9 +699,13 @@ def main():
         model_id=args.model_id,
         use_flash_attn=args.use_flash_attn,
         device_map=args.device_map,
+        lora=args.lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
     )
 
-    # Resume heads first
+    # Resume heads/adapters first
     if args.resume_ckpt:
         if not os.path.exists(args.resume_ckpt):
             raise FileNotFoundError(f"--resume_ckpt not found: {args.resume_ckpt}")
@@ -533,6 +715,11 @@ def main():
         )
         safe_load_linear(model.proj_img, ckpt["proj_img"])
         safe_load_linear(model.proj_txt, ckpt["proj_txt"])
+        # Load LoRA only if both saved and current run has LoRA enabled
+        if ckpt.get("lora_enabled") and model.lora_enabled and HAS_PEFT:
+            lora_state = ckpt.get("lora_state", None)
+            if lora_state is not None:
+                set_peft_model_state_dict(model.backbone.language_model, lora_state)
         print(f"[resumed heads] {args.resume_ckpt}")
 
     # Compile heads (after loading)
@@ -556,7 +743,17 @@ def main():
         prefetch_factor=args.prefetch_factor,
         save_every=args.save_every,
         seed=args.seed,
+        optimizer_name=args.optimizer,
     )
+
+    # Startup banner
+    using_bf16 = bf16_supported()
+    print(f"[setup] model_id: {args.model_id}")
+    print(
+        f"[setup] device: {trainer.device}  bf16:{using_bf16}  fp16:{torch.cuda.is_available() and not using_bf16}"
+    )
+    print(f"[setup] lora_enabled: {model.lora_enabled}")
+    print(f"[setup] optimizer: {args.optimizer}")
 
     # Auto-batch probe
     if args.auto_batch:
@@ -578,10 +775,7 @@ def main():
         if not HAS_DATASETS:
             raise RuntimeError("Please 'pip install datasets' to use --train_hub.")
         hf_set = HFColpaliDataset(args.train_hub, split="train")
-        # Reuse triples training loop by building a wrapper? For brevity keep HF path separate in earlier scripts.
-        raise SystemExit(
-            "Auto-batch script currently supports --train_jsonl path. Use the patched v2 script for --train_hub."
-        )
+        trainer.train_hf_inbatch(hf_set)
     else:
         raise ValueError("Provide either --train_jsonl or --train_hub")
 
