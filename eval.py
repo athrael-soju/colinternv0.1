@@ -35,7 +35,7 @@ if __name__ == "__main__":
 
     model = ColInternMTEB(
         base_model_id="OpenGVLab/InternVL3_5-1B-Instruct",
-        ckpt_path="outputs/colintern_heads_epoch1.pt",
+        ckpt_path="outputs/train/colintern_heads_epoch1.pt",
     )
     
     print("model:", type(model).__name__,
@@ -43,8 +43,9 @@ if __name__ == "__main__":
           "sim:", getattr(model, "similarity_fn_name", None), flush=True)
 
     bench = get_benchmark("ViDoRe(v1)")
+    os.makedirs("outputs/eval", exist_ok=True)
     MTEB(tasks=bench.tasks, verbosity=2).run(
         model,
-        output_folder="results",
+        output_folder="outputs/eval",
         overwrite_results=True,
     )

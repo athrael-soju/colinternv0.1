@@ -4,7 +4,7 @@ timm
 accelerate
 datasets
 pillow
-faiss-gpu-cu12
 mteb[vision]
 bitsandbytes
 peft
+faiss-gpu-cu12

@@ -687,7 +687,7 @@ def main():
     ap.add_argument("--train_hub", type=str, default=None)
     ap.add_argument("--train_jsonl", type=str, default=None)
     ap.add_argument("--root", type=str, default=".")
-    ap.add_argument("--out_dir", type=str, default="outputs")
+    ap.add_argument("--out_dir", type=str, default="outputs/train")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=5e-5)

@@ -78,10 +78,10 @@ def encode_queries_batch(backbone, tokenizer, proj_txt, texts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_id", type=str, default="OpenGVLab/InternVL3_5-1B-Instruct")
-    ap.add_argument("--ckpt", type=str, required=True, help="projection heads checkpoint .pt")
+    ap.add_argument("--ckpt", type=str, required=True, default="outputs/train/colintern_heads_epoch1.pt", help="projection heads checkpoint .pt")
     ap.add_argument("--hub_name", type=str, default="vidore/colpali_train_set")
     ap.add_argument("--split", type=str, default="train")
-    ap.add_argument("--out_jsonl", type=str, default="mined_triples.jsonl")
+    ap.add_argument("--out_jsonl", type=str, default="outputs/mine/mined_triples.jsonl")
     ap.add_argument("--k", type=int, default=20, help="hard negatives per query")
     ap.add_argument("--doc_batch", type=int, default=16, help="doc encoding batch size")
     ap.add_argument("--query_batch", type=int, default=64, help="query encoding batch size")
@@ -125,7 +125,9 @@ def main():
     assert added == N, f"Indexed {added} != dataset size {N}"
 
     # --- Search for each query in batches and write JSONL ---
-    with open(args.out_jsonl, "w", encoding="utf-8") as f:
+    out_path = Path(args.out_jsonl)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
         qb = args.query_batch
         for qstart in range(0, N, qb):
             qstop = min(qstart + qb, N)
@@ -148,7 +150,7 @@ def main():
             if qstop % 1000 == 0 or qstop == N:
                 print(f"Mined queries: {qstop}/{N}")
 
-    print(f"[done] wrote mined triples to {args.out_jsonl}")
+    print(f"[done] wrote mined triples to {out_path}")
 
 if __name__ == "__main__":
     main()

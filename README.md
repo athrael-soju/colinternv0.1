@@ -31,9 +31,10 @@ uv pip install flash-attn --no-build-isolation
 
 ```bash
 python train.py \
+  --model_id OpenGVLab/InternVL3_5-1B-Instruct \
   --train_hub vidore/colpali_train_set \
   --batch_size 4 \
-  --grad_accum 8 \
+  --grad_accum 4 \
   --epochs 1 \
   --lr 5e-5 \
   --auto_batch \
@@ -46,17 +47,17 @@ python train.py \
   --lora_dropout 0.1 \
   --optimizer paged_adamw_8bit \
   --use_flash_attn \
-  --save_every 500
+  --save_every 50
 ```
 
 This uses in-batch negatives only.
 At the end you will have:
 
 ```
-./outputs/colintern_heads_epoch1.pt
+outputs/train/colintern_heads_epoch1.pt
 ```
 
-and also step snapshots like `colintern_heads_step400.pt` (because `--save_every 400`).
+and also step snapshots like `outputs/train/colintern_heads_step400.pt` (because `--save_every 400`).
 
 ---
 
@@ -67,10 +68,10 @@ Use the miner to create a JSONL triples file containing hard negatives:
 ```bash
 python mine.py \
   --model_id OpenGVLab/InternVL3_5-1B-Instruct \
-  --ckpt ./outputs/colintern/colintern_heads_epoch1.pt \
+  --ckpt outputs/train/colintern_heads_epoch1.pt \
   --hub_name vidore/colpali_train_set \
   --split train \
-  --out_jsonl ./outputs/colintern/mined_triples.jsonl \
+  --out_jsonl outputs/mine/mined_triples.jsonl \
   --k 20 --doc_batch 16 --query_batch 64
 ```
 
@@ -89,9 +90,9 @@ Output example (one line per query):
 ```bash
 python train.py \
   --model_id OpenGVLab/InternVL3_5-1B-Instruct \
-  --train_jsonl ./outputs/colintern/mined_triples.jsonl \
-  --out_dir ./outputs/colintern \
-  --resume_ckpt ./outputs/colintern/colintern_heads_epoch1.pt \
+  --train_jsonl outputs/mine/mined_triples.jsonl \
+  --out_dir outputs/train \
+  --resume_ckpt outputs/train/colintern_heads_epoch1.pt \
   --batch_size 8 --grad_accum 4 \
   --num_workers 8 --prefetch_factor 6 \
   --save_every 2500 --compile_heads --device_map cuda:0
@@ -123,20 +124,11 @@ This prints the canonical names (they may be like `ViDoRe(v2)`/`ViDoRe(v1)`).
 2) Run evaluation (replace names with what your registry shows):
 
 ```bash
-# Single benchmark (example)
-python -u eval.py \
-  --ckpt outputs/colintern_epoch2/colintern_heads_epoch2.pt \
-  --benchmarks ViDoRe(v2) \
-  --device cuda:0
-
-# Multiple benchmarks
-python -u eval.py \
-  --ckpt outputs/colintern_epoch2/colintern_heads_epoch2.pt \
-  --benchmarks ViDoRe(v2) ViDoRe(v1) \
-  --device cuda:0
+# Example (eval.py writes to outputs/eval/ and reads ckpt from outputs/train/)
+python -u eval.py
 ```
 
-Output paths are printed at the end by `eval.py`.
+Results are saved under `outputs/eval/` (created automatically by `eval.py`).
 
 Troubleshooting:
 
@@ -158,7 +150,7 @@ If you want to train on local images instead of HF datasets:
 Run:
 
 ```bash
-python train_colintern.py \
+python train.py \
   --model_id OpenGVLab/InternVL3_5-1B-Instruct \
   --train_jsonl /path/to/train.jsonl \
   --root /path/to \
@@ -176,18 +168,18 @@ python train_colintern.py \
 - Resume from a snapshot:
 
 ```bash
-python train_colintern.py ... --resume_ckpt ./outputs/colintern/colintern_heads_step25000.pt
+python train.py ... --resume_ckpt ./outputs/colintern/colintern_heads_step25000.pt
 ```
 
 ---
 
 ## Files in this repo
 
-- `train_colintern.py` — head-only trainer (HF datasets + JSONL + HF-ID resolver)
+- `train.py` — head-only trainer (HF datasets via `--train_hub` or local JSONL via `--train_jsonl`)
+- `mine.py` — mines hard negatives from an HF dataset using a trained checkpoint
 - `eval.py` — MTEB-based ViDoRe evaluation runner
-- `mine_hard_negatives.py` — mines hard negatives from an HF dataset using a trained checkpoint
+- `mteb_model.py` — model wrapper used by the evaluator
 - `requirements.txt` — dependencies
-- `plot_training_loss.py` — plot loss from `training_loss.txt` written under `--out_dir`
 
 ---
 
@@ -195,7 +187,6 @@ python train_colintern.py ... --resume_ckpt ./outputs/colintern/colintern_heads_
 
 - Finish epoch 1 (you should see loss ~0.5–0.6).
 - Mine **K=20–50** hard negatives per query; train 1–2 more epochs.
-- Try **InternVL3.5-14B** next; or keep 4B and increase `proj_dim` to **256**.
 - Ensure dynamic tiling via the model `AutoProcessor` path (already handled by the script).
 - Evaluate frequently on ViDoRe subsamples to track NDCG/Recall gains.
 
@@ -207,7 +198,7 @@ python train_colintern.py ... --resume_ckpt ./outputs/colintern/colintern_heads_
 
   ```bash
   python plot_training_loss.py \
-    --input outputs/colintern/training_loss.txt \
+    --input outputs/train/training_loss.txt \
     --output outputs/training_loss.png \
     --smooth 200
   ```
@@ -233,18 +224,11 @@ python train_colintern.py ... --resume_ckpt ./outputs/colintern/colintern_heads_
 
 ## Known limitations
 
-- The current `train_colintern.py` path only supports `--train_jsonl`. Supplying `--train_hub` will exit with a message. Use the bootstrap JSONL above to start from HF datasets.
-- `proj_dim` is not exposed via CLI; edit `ColIntern(..., proj_dim=...)` in `train_colintern.py` to change it.
+- Requires internet access for HF datasets when using `--train_hub`.
+- FAISS-GPU is optional but strongly recommended for fast mining.
+- Benchmark names in MTEB can differ by version; list them before running.
 
 ---
-
-## Tips to beat ColQwen2.5-v0.2 on ViDoRe V2
-
-- Finish epoch 1 (you should see loss ~0.5–0.6).
-- Mine **K=20–50** hard negatives per query; train 1–2 more epochs.
-- Try **InternVL3.5-14B** next; or keep 4B and increase `proj_dim` to **256**.
-- Ensure dynamic tiling via the model `AutoProcessor` path (already handled by the script).
-- Evaluate frequently on ViDoRe subsamples to track NDCG/Recall gains.
 
 To use FAISS-GPU in WSL, you must install the toolkit first:
 
@@ -339,7 +323,7 @@ OK: (5, 5) (5, 5)
 cd ../
 python mine_hard_negatives.py 
   --model_id OpenGVLab/InternVL3_5-1B-Instruct 
-  --ckpt ./outputs/colintern/colintern_heads_epoch1.pt 
+  --ckpt outputs/train/colintern_heads_epoch1.pt 
   --hub_name vidore/colpali_train_set --split train 
-  --out_jsonl ./outputs/colintern/mined_triples.jsonl 
+  --out_jsonl outputs/mine/mined_triples.jsonl 
   --k 20 --doc_batch 16 --query_batch 64
