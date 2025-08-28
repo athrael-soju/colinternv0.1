@@ -257,22 +257,23 @@ class ColIntern(nn.Module):
             self.backbone.language_model = lm
             self.backbone.language_model.train()  # adapters will be trainable
 
-    hidden = (
-        getattr(getattr(self.backbone.config, "llm_config", None), "hidden_size", None)
-        or getattr(
-            getattr(self.backbone, "language_model", None),
-            "config",
-            type("x", (), {})(),
-        ).__dict__.get("hidden_size", None)
-        or getattr(self.backbone.config, "hidden_size", None)
-    )
-    if hidden is None:
-        raise AttributeError(
-            "Could not infer hidden_size from backbone; please set manually."
+        # Infer hidden size from backbone/LLM config and build projection heads
+        hidden = (
+            getattr(getattr(self.backbone.config, "llm_config", None), "hidden_size", None)
+            or getattr(
+                getattr(self.backbone, "language_model", None),
+                "config",
+                type("x", (), {})(),
+            ).__dict__.get("hidden_size", None)
+            or getattr(self.backbone.config, "hidden_size", None)
         )
-    self.proj_dim = proj_dim
-    self.proj_img = nn.Linear(hidden, proj_dim, bias=False).to(self.device)
-    self.proj_txt = nn.Linear(hidden, proj_dim, bias=False).to(self.device)
+        if hidden is None:
+            raise AttributeError(
+                "Could not infer hidden_size from backbone; please set manually."
+            )
+        self.proj_dim = proj_dim
+        self.proj_img = nn.Linear(hidden, proj_dim, bias=False).to(self.device)
+        self.proj_txt = nn.Linear(hidden, proj_dim, bias=False).to(self.device)
 
     # ---- token extractors ----
     def image_tokens(self, pixel_values: torch.Tensor) -> torch.Tensor:
