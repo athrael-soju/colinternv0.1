@@ -188,7 +188,24 @@ class ImagePreprocessor:
 
     def load_pil(self, pil_list: List[Image.Image]) -> torch.Tensor:
         if self.processor is not None:
-            batch = self.processor(images=pil_list, return_tensors="pt")
+            try:
+                batch = self.processor(images=pil_list, return_tensors="pt")
+            except Exception:
+                # Some processors (e.g., multimodal Instruct) require a text field; use empty prompts
+                try:
+                    batch = self.processor(
+                        images=pil_list,
+                        text=[""] * len(pil_list),
+                        return_tensors="pt",
+                    )
+                except Exception:
+                    # Fall back to raw image processor/feature extractor if exposed
+                    ip = getattr(self.processor, "image_processor", None) or getattr(
+                        self.processor, "feature_extractor", None
+                    )
+                    if ip is None:
+                        raise
+                    batch = ip(images=pil_list, return_tensors="pt")
             px = batch["pixel_values"]
         else:
             px = torch.stack([self.fallback(img.convert("RGB")) for img in pil_list])
