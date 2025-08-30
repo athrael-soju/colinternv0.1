@@ -50,6 +50,7 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
         self.query_prefix = query_prefix
         self.max_num_visual_tokens = int(max_num_visual_tokens)
         self.extra_kwargs = kwargs
+        self.query_augmentation_token = kwargs.pop("query_augmentation_token", "")
 
         # ColPali processors generally left-pad queries for stable MaxSim batching
         if hasattr(self.tokenizer, "padding_side"):
@@ -63,6 +64,7 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
         trust_remote_code: bool = True,
         query_prefix: str = "Query: ",
         max_num_visual_tokens: int = 256,
+        query_augmentation_token: str = "",
         **kwargs,
     ) -> "ColInternProcessor":
         hf_processor = AutoProcessor.from_pretrained(
@@ -81,6 +83,7 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
             hf_tokenizer=tok,
             query_prefix=query_prefix,
             max_num_visual_tokens=max_num_visual_tokens,
+            query_augmentation_token=query_augmentation_token,
             **kwargs,
         )
 
@@ -96,17 +99,29 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
         )
         return enc
 
-    def process_images(self, images: Sequence[Image.Image]) -> BatchEncoding:
+    def process_images(self, images):
         """
-        Prepare images for the InternVL processor. Returns a mapping that at least
-        contains 'pixel_values' (B, C, H, W). Any InternVL-specific extra fields
-        (tiling metadata, etc.) are passed through transparently.
+        Returns image features for a list of PIL images / arrays.
+        InternVL AutoProcessor.__call__ requires text; use image_processor if present,
+        otherwise fall back to blank texts.
         """
-        imgs = _as_list(images)
-        out: BatchFeature = self.processor(images=imgs, return_tensors="pt")
-        if isinstance(out, dict):
-            return BatchEncoding(out)
-        return out  # already a BatchFeature
+        # normalize to a list
+        if images is None:
+            return {}
+        if not isinstance(images, (list, tuple)):
+            imgs = [images]
+        else:
+            imgs = list(images)
+
+        # Prefer the dedicated image processor when available (InternVL has this)
+        if hasattr(self.processor, "image_processor"):
+            out = self.processor.image_processor(images=imgs, return_tensors="pt")
+        else:
+            # Fallback: call the unified processor with empty texts
+            empty_texts = [""] * len(imgs)
+            out = self.processor(images=imgs, text=empty_texts, return_tensors="pt")
+
+    return out
 
     def get_n_patches(self, images: Sequence[Image.Image]) -> List[int]:
         """
