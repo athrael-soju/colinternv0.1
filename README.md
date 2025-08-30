@@ -16,7 +16,7 @@ Repository contents
 Prerequisites
 -------------
 - Python 3.10+ recommended
-- GPU with recent CUDA for NVIDIA training, or Apple Silicon with MPS for Mac
+- GPU with recent CUDA for NVIDIA training
 - Git, uv or pip/venv
 
 Install dependencies
@@ -87,12 +87,6 @@ Quickstart: training
 
 ```
 accelerate launch scripts/train/train_colbert.py scripts/configs/internvl3_5/train_colintern_model.yaml
-```
-
-- Mac (MPS):
-
-```
-accelerate launch scripts/train/train_colbert.py scripts/configs/internvl3_5/train_colintern_model_mps.yaml
 ```
 
 Configuration highlights
