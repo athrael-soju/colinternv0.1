@@ -50,7 +50,7 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
         self.query_prefix = query_prefix
         self.max_num_visual_tokens = int(max_num_visual_tokens)
         self.extra_kwargs = kwargs
-        self.query_augmentation_token = kwargs.pop("query_augmentation_token", "")
+        self.query_augmentation_token = kwargs.pop("query_augmentation_token", "<|endoftext|>")
 
         # ColPali processors generally left-pad queries for stable MaxSim batching
         if hasattr(self.tokenizer, "padding_side"):
@@ -121,7 +121,7 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
             empty_texts = [""] * len(imgs)
             out = self.processor(images=imgs, text=empty_texts, return_tensors="pt")
 
-    return out
+        return out
 
     def get_n_patches(self, images: Sequence[Image.Image]) -> List[int]:
         """
