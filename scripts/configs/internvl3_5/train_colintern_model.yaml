@@ -11,12 +11,14 @@ config:
     class_to_instanciate: !ext colpali_engine.models.ColInternProcessor
     pretrained_model_name_or_path: "OpenGVLab/InternVL3_5-4B-Instruct"
     trust_remote_code: true
-    # optional, recommended to avoid unexpected upstream changes
     revision: "main"
     query_prefix: "Query: "
     max_num_visual_tokens: 768
-    # optional; your processor already defaults to ""
     query_augmentation_token: ""
+    # ↓↓↓ NEW ↓↓↓
+    image_size: 336        # 448 → 336 (tokens/tile: 1024 → 576)
+    max_tiles: 4           # 12 → 4 (3× fewer tiles)
+    use_thumbnail: true
 
   # === Model ===
   model:
@@ -27,8 +29,8 @@ config:
     revision: "main"                 # optional pin
     torch_dtype: !ext torch.bfloat16
     attn_implementation: "flash_attention_2"
-    device_map: "auto"
-    use_flash_attn: true             # <— important for InternVL3.5
+    device_map: "cuda"
+    use_flash_attn: true
 
   # === Training ===
   train_dataset:
@@ -40,13 +42,13 @@ config:
 
   tr_args:
     (): transformers.training_args.TrainingArguments
-    per_device_train_batch_size: 4
-    gradient_accumulation_steps: 64
+    per_device_train_batch_size: 8
+    gradient_accumulation_steps: 16
     # optional VRAM saver
-    gradient_checkpointing: true
-    gradient_checkpointing_kwargs: { "use_reentrant": false }
+    gradient_checkpointing: false
+    # gradient_checkpointing_kwargs: { "use_reentrant": false }
     # logging/checkpointing
-    logging_steps: 50
+    logging_steps: 10
     save_steps: 500
     save_total_limit: 1
     # mixed precision / kernels
@@ -55,10 +57,12 @@ config:
     # dataloader hygiene (WSL-friendly)
     remove_unused_columns: false
     ddp_find_unused_parameters: false
-    dataloader_num_workers: 8
-    dataloader_pin_memory: false
+    dataloader_num_workers: 12
+    dataloader_pin_memory: true
     eval_strategy: "no"
-
+    torch_compile: false
+    optim: "adamw_torch_fused"
+    
   # === LoRA ===
   peft_config:
     (): peft.LoraConfig
