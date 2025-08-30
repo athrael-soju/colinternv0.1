@@ -19,7 +19,6 @@ config:
     class_to_instanciate: !ext colpali_engine.models.ColIntern
     pretrained_model_name_or_path: "OpenGVLab/InternVL3_5-4B-Instruct"
     torch_dtype: !ext torch.bfloat16
-    use_cache: false
     trust_remote_code: true
     attn_implementation: "flash_attention_2"
 
@@ -38,7 +37,6 @@ config:
 
   tr_args:
     (): transformers.training_args.TrainingArguments
-    # keep epochs, LR, etc.
     per_device_train_batch_size: 4
     gradient_accumulation_steps: 64
 

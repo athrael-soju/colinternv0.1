@@ -114,39 +114,45 @@ class ColIntern(nn.Module):
     @torch.inference_mode(False)
     def _extract_visual_tokens(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
         """
-        Return image token features: (B, T_img, H).
+        Return pre-LLM visual token embeddings (B, T_img, H) from InternVL3.5-*.
 
-        ⚠️ TODO – hook this to your InternVL variant:
-            Many InternVL3/3.5 checkpoints expose a method to get visual embeddings/tokens.
-            Common patterns (one of these is usually available):
-              - self.backbone.get_image_features(pixel_values=..., output_hidden_states=True, return_dict=True)
-              - self.backbone.vision_tower(pixel_values, output_hidden_states=True, return_dict=True).last_hidden_state
-              - self.backbone.model.vision_tower(...)
-            Aim to return *pre-LLM* visual token embeddings (not the final logits).
-
-            As a safe fallback (slower + mixes text prompts), you can run a tiny “visual prompt”
-            through the LLM along with images and then slice image-token ranges out, but the
-            cleaner approach is using the dedicated vision path.
-
-        Below we include a simple, conservative stub which raises if no dedicated method is found.
+        We try a few stable entry points used by OpenGVLab remotes:
+          1) get_image_features(..., output_hidden_states=True) -> .last_hidden_state
+          2) vision_tower(..., output_hidden_states=True)       -> .last_hidden_state
+          3) get_vision_tower()(..., output_hidden_states=True) -> .last_hidden_state
         """
-        # Example implementations you might uncomment after verifying your backbone:
+        # 1) Preferred: dedicated image feature API
         if hasattr(self.backbone, "get_image_features"):
-            out = self.backbone.get_image_features(pixel_values=pixel_values, output_hidden_states=True, return_dict=True)
+            out = self.backbone.get_image_features(
+                pixel_values=pixel_values,
+                output_hidden_states=True,
+                return_dict=True,
+            )
             if hasattr(out, "last_hidden_state"):
-                return out.last_hidden_state  # (B, T_img, H)
+                return out.last_hidden_state
             if isinstance(out, torch.Tensor):
                 return out
 
-        # Some remotes map the vision tower at .vision_tower or .model.vision_tower
-        vt = getattr(self.backbone, "vision_tower", None) or getattr(getattr(self.backbone, "model", None), "vision_tower", None)
+        # 2) Many remotes expose a .vision_tower module
+        vt = getattr(self.backbone, "vision_tower", None) \
+             or getattr(getattr(self.backbone, "model", None), "vision_tower", None)
         if vt is not None:
             out = vt(pixel_values, output_hidden_states=True, return_dict=True)
-            return out.last_hidden_state  # (B, T_img, H)
+            if hasattr(out, "last_hidden_state"):
+                return out.last_hidden_state
 
+        # 3) Some expose an accessor
+        get_vt = getattr(self.backbone, "get_vision_tower", None)
+        if callable(get_vt):
+            vt = get_vt()
+            out = vt(pixel_values, output_hidden_states=True, return_dict=True)
+            if hasattr(out, "last_hidden_state"):
+                return out.last_hidden_state
+
+        # If we ever land here, print some hints to stderr and fail clearly.
         raise NotImplementedError(
-            "ColIntern._extract_visual_tokens: Please wire this method to your InternVL3.5 backbone's vision path.\n"
-            "See comments in the function for typical entry points."
+            "ColIntern: could not extract visual tokens. "
+            "Check your InternVL3.5 checkpoint; try .get_image_features or .vision_tower."
         )
 
     # -------- Forward (unified) --------
