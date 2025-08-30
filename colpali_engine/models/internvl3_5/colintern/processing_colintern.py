@@ -50,7 +50,7 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
         self.query_prefix = query_prefix
         self.max_num_visual_tokens = int(max_num_visual_tokens)
         self.extra_kwargs = kwargs
-        self.query_augmentation_token = kwargs.pop("query_augmentation_token", "<|endoftext|>")
+        self.query_augmentation_token = kwargs.pop("query_augmentation_token", "")
 
         # ColPali processors generally left-pad queries for stable MaxSim batching
         if hasattr(self.tokenizer, "padding_side"):
