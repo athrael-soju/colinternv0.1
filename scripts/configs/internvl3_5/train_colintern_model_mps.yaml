@@ -9,16 +9,16 @@ config:
     (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
     class_to_instanciate: !ext colpali_engine.models.ColInternProcessor
     # Use your local or HF path
-    pretrained_model_name_or_path: "./models/InternVL3.5-VL-4B-Instruct"
+    pretrained_model_name_or_path: "OpenGVLab/InternVL3_5-4B-Instruct"
 
   # === Model ===
   model:
     (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
     class_to_instanciate: !ext colpali_engine.models.ColIntern
-    pretrained_model_name_or_path: "./models/InternVL3.5-VL-4B-Instruct"
+    pretrained_model_name_or_path: "OpenGVLab/InternVL3_5-4B-Instruct"
     torch_dtype: !ext torch.float16  # MPS prefers fp16 for stability
     use_cache: false
-    attn_implementation: "sdpa"
+    attn_implementation: "flash_attention_2"
 
   # === Data ===
   # Either provide a train_dataset directly or a loader function.
