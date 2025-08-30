@@ -70,6 +70,7 @@ class ColIntern(nn.Module):
     ) -> "ColIntern":
         """
         Mirrors HF APIs enough for AllPurposeWrapper + README examples.
+        Robustly infers the text hidden_size for InternVL3.5 chat models.
         """
         model_kwargs = dict(trust_remote_code=trust_remote_code or True)
         if torch_dtype is not None:
@@ -81,16 +82,69 @@ class ColIntern(nn.Module):
         # Pass through any extra kwargs (quantization_config, etc.)
         model_kwargs.update(kwargs)
 
-        # Load InternVL-3.5 family model (CausalLM-style). Many expose text & vision towers.
+        # Load InternVL-3.5 family model (typically InternVLChatModel)
         backbone = AutoModel.from_pretrained(pretrained_model_name_or_path, **model_kwargs)
 
-        # Hidden size sometimes sits at config.hidden_size, or text_config.hidden_size (Qwen-family).
-        hf_cfg: AutoConfig = backbone.config
-        hidden_size = getattr(hf_cfg, "hidden_size", None)
+        # --- Infer hidden size robustly ---
+        hidden_size = None
+        cfg = getattr(backbone, "config", None)
+
+        def _maybe(x):
+            return x if isinstance(x, int) and x > 0 else None
+
+        # 1) Try common config fields
+        candidates = []
+        if cfg is not None:
+            candidates += [
+                getattr(cfg, "hidden_size", None),
+                getattr(getattr(cfg, "text_config", None), "hidden_size", None),
+                getattr(getattr(cfg, "llm_config", None), "hidden_size", None),
+                getattr(getattr(cfg, "qwen2_config", None), "hidden_size", None),
+            ]
+        for c in candidates:
+            c = _maybe(c)
+            if c is not None:
+                hidden_size = c
+                break
+
+        # 2) Try model's input embeddings (many chat models implement this)
+        if hidden_size is None and hasattr(backbone, "get_input_embeddings"):
+            try:
+                emb = backbone.get_input_embeddings()
+                if hasattr(emb, "embedding_dim"):
+                    hidden_size = int(emb.embedding_dim)
+            except Exception:
+                pass
+
+        # 3) Probe common submodules for embed_tokens
         if hidden_size is None:
-            hidden_size = getattr(getattr(hf_cfg, "text_config", None), "hidden_size", None)
+            def _get(obj, path: str):
+                cur = obj
+                for p in path.split("."):
+                    cur = getattr(cur, p, None)
+                    if cur is None:
+                        return None
+                return cur
+
+            probe_paths = [
+                "model.embed_tokens",
+                "language_model.embed_tokens",
+                "language_model.model.embed_tokens",
+                "llm.embed_tokens",
+                "text_model.embed_tokens",
+                "transformer.embed_tokens",
+            ]
+            for p in probe_paths:
+                mod = _get(backbone, p)
+                if mod is not None and hasattr(mod, "embedding_dim"):
+                    hidden_size = int(mod.embedding_dim)
+                    break
+
         if hidden_size is None:
-            raise ValueError("Could not infer hidden_size from backbone.config; please set explicitly.")
+            raise ValueError(
+                "ColIntern: could not infer hidden_size from InternVL backbone. "
+                "Please report the model variant or set hidden_size manually."
+            )
 
         return cls(backbone=backbone, hidden_size=hidden_size, proj_dim=kwargs.pop("proj_dim", DEFAULT_EMBED_DIM))
 
