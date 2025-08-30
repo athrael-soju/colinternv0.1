@@ -10,16 +10,21 @@ config:
     class_to_instanciate: !ext colpali_engine.models.ColInternProcessor
     pretrained_model_name_or_path: "OpenGVLab/InternVL3_5-4B-Instruct"
     trust_remote_code: true
+    # optional, recommended to avoid unexpected upstream changes
+    revision: "main"
     query_prefix: "Query: "
     max_num_visual_tokens: 768
+    # optional; your processor already defaults to ""
+    query_augmentation_token: ""
 
   # === Model ===
   model:
     (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
     class_to_instanciate: !ext colpali_engine.models.ColIntern
     pretrained_model_name_or_path: "OpenGVLab/InternVL3_5-4B-Instruct"
-    torch_dtype: !ext torch.bfloat16
     trust_remote_code: true
+    revision: "main"                 # optional pin
+    torch_dtype: !ext torch.bfloat16
     attn_implementation: "flash_attention_2"
     device_map: "auto"
 
@@ -35,13 +40,21 @@ config:
     (): transformers.training_args.TrainingArguments
     per_device_train_batch_size: 4
     gradient_accumulation_steps: 64
+    # optional VRAM saver
+    gradient_checkpointing: true
+    gradient_checkpointing_kwargs: { "use_reentrant": false }
+    # logging/checkpointing
     logging_steps: 50
     save_steps: 500
     save_total_limit: 1
+    # mixed precision / kernels
     bf16: true
     tf32: true
+    # dataloader hygiene (WSL-friendly)
     remove_unused_columns: false
     ddp_find_unused_parameters: false
+    dataloader_num_workers: 8
+    dataloader_pin_memory: false
     eval_strategy: "no"
 
   # === LoRA ===

@@ -6,10 +6,7 @@ from typing import Optional, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoConfig
-
-# This model returns token-level embeddings compatible with ColPali losses & processors.
-# We keep names ("custom_text_proj", optional "custom_vision_proj") LoRA-friendly, as in existing configs.
+from transformers import AutoModel
 
 DEFAULT_EMBED_DIM = 128  # dimension of the multi-vector embeddings after projection
 
@@ -35,12 +32,6 @@ class ColIntern(nn.Module):
       - For queries (text):  input_ids, attention_mask
       - For images (vision): pixel_values (+ any InternVL-specific vision kwargs returned by the processor)
     Forward returns (B, T, D) token embeddings suitable for ColBERT-style MaxSim scoring.
-
-    Notes
-    -----
-    * This is intentionally lightweight; it does NOT subclass PreTrainedModel.
-      The repo uses AllPurposeWrapper to call .from_pretrained(...) on classes registered in colpali_engine.models.
-    * The single place you may need to adapt per InternVL build is `_extract_visual_tokens(...)`.
     """
 
     def __init__(self, backbone: nn.Module, hidden_size: int, proj_dim: int = DEFAULT_EMBED_DIM):
@@ -53,7 +44,6 @@ class ColIntern(nn.Module):
         self.custom_text_proj = nn.Linear(hidden_size, proj_dim, bias=False)
         self.custom_vision_proj = nn.Linear(hidden_size, proj_dim, bias=False)
 
-        # Small init for stability when using LoRA deltas on top of base (mirrors ColPali/Qwen practice).
         nn.init.normal_(self.custom_text_proj.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.custom_vision_proj.weight, mean=0.0, std=0.02)
 
@@ -82,17 +72,15 @@ class ColIntern(nn.Module):
         # Pass through any extra kwargs (quantization_config, etc.)
         model_kwargs.update(kwargs)
 
-        # Load InternVL-3.5 family model (typically InternVLChatModel)
         backbone = AutoModel.from_pretrained(pretrained_model_name_or_path, **model_kwargs)
 
         # --- Infer hidden size robustly ---
         hidden_size = None
         cfg = getattr(backbone, "config", None)
 
-        def _maybe(x):
+        def _maybe_int(x):
             return x if isinstance(x, int) and x > 0 else None
 
-        # 1) Try common config fields
         candidates = []
         if cfg is not None:
             candidates += [
@@ -102,12 +90,11 @@ class ColIntern(nn.Module):
                 getattr(getattr(cfg, "qwen2_config", None), "hidden_size", None),
             ]
         for c in candidates:
-            c = _maybe(c)
+            c = _maybe_int(c)
             if c is not None:
                 hidden_size = c
                 break
 
-        # 2) Try model's input embeddings (many chat models implement this)
         if hidden_size is None and hasattr(backbone, "get_input_embeddings"):
             try:
                 emb = backbone.get_input_embeddings()
@@ -116,7 +103,6 @@ class ColIntern(nn.Module):
             except Exception:
                 pass
 
-        # 3) Probe common submodules for embed_tokens
         if hidden_size is None:
             def _get(obj, path: str):
                 cur = obj
@@ -143,44 +129,33 @@ class ColIntern(nn.Module):
         if hidden_size is None:
             raise ValueError(
                 "ColIntern: could not infer hidden_size from InternVL backbone. "
-                "Please report the model variant or set hidden_size manually."
+                "Please set hidden_size manually or report the model variant."
             )
 
         return cls(backbone=backbone, hidden_size=hidden_size, proj_dim=kwargs.pop("proj_dim", DEFAULT_EMBED_DIM))
 
     # -------- Internals --------
     @torch.inference_mode(False)
-    def _extract_text_tokens(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Return last hidden states for text tokens: (B, T_txt, H)
-        Works with InternVL-3.5 when called without images.
-        """
+    def _extract_text_tokens(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **extras) -> torch.Tensor:
+        # Only forward non-text keys to the backbone (avoid duplicating input_ids/attention_mask)
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
-            **{k: v for k, v in kwargs.items() if k not in {"pixel_values"}}
+            **extras,
         )
-        hidden = outputs.last_hidden_state  # (B, T_txt, H)
-        return hidden
+        return outputs.last_hidden_state  # (B, T_txt, H)
 
     @torch.inference_mode(False)
-    def _extract_visual_tokens(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Return pre-LLM visual token embeddings (B, T_img, H) from InternVL3.5-*.
-
-        We try a few stable entry points used by OpenGVLab remotes:
-          1) get_image_features(..., output_hidden_states=True) -> .last_hidden_state
-          2) vision_tower(..., output_hidden_states=True)       -> .last_hidden_state
-          3) get_vision_tower()(..., output_hidden_states=True) -> .last_hidden_state
-        """
+    def _extract_visual_tokens(self, pixel_values: torch.Tensor, **extras) -> torch.Tensor:
         # 1) Preferred: dedicated image feature API
         if hasattr(self.backbone, "get_image_features"):
             out = self.backbone.get_image_features(
                 pixel_values=pixel_values,
                 output_hidden_states=True,
                 return_dict=True,
+                **extras,
             )
             if hasattr(out, "last_hidden_state"):
                 return out.last_hidden_state
@@ -191,7 +166,7 @@ class ColIntern(nn.Module):
         vt = getattr(self.backbone, "vision_tower", None) \
              or getattr(getattr(self.backbone, "model", None), "vision_tower", None)
         if vt is not None:
-            out = vt(pixel_values, output_hidden_states=True, return_dict=True)
+            out = vt(pixel_values, output_hidden_states=True, return_dict=True, **extras)
             if hasattr(out, "last_hidden_state"):
                 return out.last_hidden_state
 
@@ -199,11 +174,10 @@ class ColIntern(nn.Module):
         get_vt = getattr(self.backbone, "get_vision_tower", None)
         if callable(get_vt):
             vt = get_vt()
-            out = vt(pixel_values, output_hidden_states=True, return_dict=True)
+            out = vt(pixel_values, output_hidden_states=True, return_dict=True, **extras)
             if hasattr(out, "last_hidden_state"):
                 return out.last_hidden_state
 
-        # If we ever land here, print some hints to stderr and fail clearly.
         raise NotImplementedError(
             "ColIntern: could not extract visual tokens. "
             "Check your InternVL3.5 checkpoint; try .get_image_features or .vision_tower."
@@ -219,20 +193,72 @@ class ColIntern(nn.Module):
         Returns a (B, T, D) tensor of L2-normalized token embeddings.
         """
         if "pixel_values" in inputs:
-            # vision path
             pixel_values = inputs["pixel_values"]
-            hidden = self._extract_visual_tokens(pixel_values=pixel_values, **inputs)
+            # Filter out keys that do not belong to the vision path
+            extras = {k: v for k, v in inputs.items() if k not in {"pixel_values", "input_ids", "attention_mask"}}
+            hidden = self._extract_visual_tokens(pixel_values=pixel_values, **extras)
             proj = self.custom_vision_proj(hidden)
         else:
-            # text path
             input_ids = inputs["input_ids"]
             attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
-            hidden = self._extract_text_tokens(input_ids=input_ids, attention_mask=attention_mask, **inputs)
+            # Filter out the text keys so we don't pass them twice
+            extras = {k: v for k, v in inputs.items() if k not in {"input_ids", "attention_mask", "pixel_values"}}
+            hidden = self._extract_text_tokens(input_ids=input_ids, attention_mask=attention_mask, **extras)
             proj = self.custom_text_proj(hidden)
 
         # L2 normalize for ColBERT MaxSim stability
-        proj = F.normalize(proj, p=2, dim=-1)  # (B, T, D)
-        return proj
+        return F.normalize(proj, p=2, dim=-1)  # (B, T, D)
+
+    # -------- Gradient checkpointing shims (for HF Trainer compatibility) --------
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None):
+        # Disable use_cache if present (it conflicts with GC in many decoder LMs)
+        cfg = getattr(self.backbone, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            try:
+                cfg.use_cache = False
+            except Exception:
+                pass
+
+        fn = getattr(self.backbone, "gradient_checkpointing_enable", None)
+        if callable(fn):
+            # Newer Transformers accepts kwargs; older ones don’t.
+            try:
+                return fn(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+            except TypeError:
+                return fn()
+
+        # Fallback: flip a common flag some backbones check
+        for m in self.backbone.modules():
+            if hasattr(m, "gradient_checkpointing"):
+                m.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        fn = getattr(self.backbone, "gradient_checkpointing_disable", None)
+        if callable(fn):
+            return fn()
+        for m in self.backbone.modules():
+            if hasattr(m, "gradient_checkpointing"):
+                m.gradient_checkpointing = False
+
+    def enable_input_require_grads(self):
+        """
+        Mirrors PreTrainedModel.enable_input_require_grads() so Trainer can make
+        embeddings require grad when GC is on.
+        """
+        if hasattr(self.backbone, "enable_input_require_grads"):
+            return self.backbone.enable_input_require_grads()
+
+        emb = getattr(self.backbone, "get_input_embeddings", lambda: None)()
+        if emb is None:
+            return
+
+        def _make_inputs_require_grad(module, input, output):
+            if isinstance(output, torch.Tensor):
+                output.requires_grad_(True)
+
+        key = "_colintern_input_req_grad_hook"
+        if not hasattr(self, key):
+            setattr(self, key, emb.register_forward_hook(_make_inputs_require_grad))
 
     # Convenience
     @property
