@@ -8,9 +8,11 @@ config:
   processor:
     (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
     class_to_instanciate: !ext colpali_engine.models.ColInternProcessor
-    # Use your local or HF path
     pretrained_model_name_or_path: "OpenGVLab/InternVL3_5-4B-Instruct"
-
+    trust_remote_code: true
+    query_prefix: "Query: "
+    max_num_visual_tokens: 768
+    
   # === Model ===
   model:
     (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
@@ -18,6 +20,7 @@ config:
     pretrained_model_name_or_path: "OpenGVLab/InternVL3_5-4B-Instruct"
     torch_dtype: !ext torch.bfloat16
     use_cache: false
+    trust_remote_code: true
     attn_implementation: "flash_attention_2"
 
   # === Data ===
@@ -33,7 +36,11 @@ config:
   loss_func:
     (): colpali_engine.loss.late_interaction_losses.ColbertPairwiseCELoss
 
-  tr_args: !import ../tr_args/default_tr_args.yaml
+  tr_args:
+    (): transformers.training_args.TrainingArguments
+    # keep epochs, LR, etc.
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 64
 
   # === LoRA ===
   peft_config:

@@ -1,13 +1,12 @@
-# colpali_engine/models/internvl3_5/colintern/processing_colintern.py
 from __future__ import annotations
-from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
+from typing import Any, Iterable, List, Sequence, Union
 
 import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, BatchEncoding, BatchFeature
 
 try:
-    # Preferred in colpali >= 0.3: base class already implements scoring & plaid helpers
+    # ColPali >= 0.3 exposes this ABC; we conform to its required interface.
     from colpali_engine.utils.processing_utils import BaseVisualRetrieverProcessor as _BaseProc
     _HAS_BASE = True
 except Exception:
@@ -23,12 +22,18 @@ def _as_list(x: Union[Image.Image, torch.Tensor, str, Iterable]) -> list:
 
 class ColInternProcessor(_BaseProc):  # type: ignore[misc]
     """
-    ColIntern processor compatible with ColPali training/eval scripts.
+    Processor for ColIntern (InternVL3.5 backbone) compatible with ColPali training/eval.
 
-    Provides:
-      - process_images(images) -> BatchEncoding/BatchFeature with 'pixel_values' (+ any internvl kwargs)
-      - process_queries(texts) -> BatchEncoding with 'input_ids' and 'attention_mask'
-      - score_multi_vector(Q, D) -> (Bq, Bd) MaxSim scores if base class not available
+    Implements the required abstract methods of BaseVisualRetrieverProcessor:
+      - process_texts(texts)   -> tokenized queries
+      - process_images(images) -> vision batch (pixel_values, etc.)
+      - get_n_patches(images)  -> estimated visual token counts per image
+      - score(q_emb, d_emb)    -> late-interaction MaxSim
+
+    Extra knobs:
+      - query_prefix: prepended to each text (default "Query: ")
+      - max_num_visual_tokens: (heuristic) returned by get_n_patches() if the processor
+        doesn't expose an explicit token-count; default 256.
     """
 
     def __init__(
@@ -36,59 +41,52 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
         hf_processor: Any,
         hf_tokenizer: Any,
         query_prefix: str = "Query: ",
+        max_num_visual_tokens: int = 256,
         **kwargs,
     ):
-        super().__init__()  # safe no-op if object
-        self.processor = hf_processor    # likely an AutoProcessor for InternVL
-        self.tokenizer = hf_tokenizer    # ensure fast tokenizer if available
-        # ColPali processors generally left-pad queries for batch MaxSim stability
+        super().__init__()  # safe no-op if base is absent
+        self.processor = hf_processor
+        self.tokenizer = hf_tokenizer
+        self.query_prefix = query_prefix
+        self.max_num_visual_tokens = int(max_num_visual_tokens)
+        self.extra_kwargs = kwargs
+
+        # ColPali processors generally left-pad queries for stable MaxSim batching
         if hasattr(self.tokenizer, "padding_side"):
             self.tokenizer.padding_side = "left"
 
-        self.query_prefix = query_prefix
-        self.extra_kwargs = kwargs
-
-    # -------- Factory --------
+    # ---------- Factory ----------
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
         trust_remote_code: bool = True,
         query_prefix: str = "Query: ",
+        max_num_visual_tokens: int = 256,
         **kwargs,
     ) -> "ColInternProcessor":
         hf_processor = AutoProcessor.from_pretrained(
             pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code or True,
         )
-        # InternVL “processor” often includes a tokenizer; keep a standalone handle too:
-        hf_tokenizer = getattr(hf_processor, "tokenizer", None)
-        if hf_tokenizer is None:
-            hf_tokenizer = AutoTokenizer.from_pretrained(
+        tok = getattr(hf_processor, "tokenizer", None)
+        if tok is None:
+            tok = AutoTokenizer.from_pretrained(
                 pretrained_model_name_or_path,
                 trust_remote_code=trust_remote_code or True,
                 use_fast=True,
             )
-        return cls(hf_processor=hf_processor, hf_tokenizer=hf_tokenizer, query_prefix=query_prefix, **kwargs)
+        return cls(
+            hf_processor=hf_processor,
+            hf_tokenizer=tok,
+            query_prefix=query_prefix,
+            max_num_visual_tokens=max_num_visual_tokens,
+            **kwargs,
+        )
 
-    # -------- Public API (ColPali-compatible) --------
-    def process_images(self, images: Sequence[Image.Image]) -> BatchEncoding:
-        """
-        Returns a dict with at least 'pixel_values' (B, C, H, W); other InternVL-specific keys
-        (e.g., dynamic resolution grids) are passed through automatically.
-        """
-        imgs = _as_list(images)
-        # Many InternVL processors support multi-resolution tiling internally.
-        out: BatchFeature = self.processor(images=imgs, return_tensors="pt")
-        if isinstance(out, dict):
-            return BatchEncoding(out)
-        # Handle corner case: some processors return BatchFeature already
-        return out  # type: ignore[return-value]
-
-    def process_queries(self, texts: Sequence[str]) -> BatchEncoding:
-        """
-        Tokenize queries with an optional "Query: " prefix; left-pad for stable MaxSim batching.
-        """
+    # ---------- Required API by BaseVisualRetrieverProcessor ----------
+    def process_texts(self, texts: Sequence[str]) -> BatchEncoding:
+        """Tokenize queries/prompts (left-padded)."""
         _texts = [f"{self.query_prefix}{t}" for t in _as_list(texts)]
         enc = self.tokenizer(
             _texts,
@@ -98,26 +96,61 @@ class ColInternProcessor(_BaseProc):  # type: ignore[misc]
         )
         return enc
 
-    # -------- Scoring (late interaction MaxSim) --------
-    # If the base class exists (preferred), we inherit its optimized implementation.
-    # Otherwise we provide a PyTorch reference implementation.
-    def score_multi_vector(self, query_embed: torch.Tensor, doc_embed: torch.Tensor) -> torch.Tensor:  # (Bq, Tq, D), (Bd, Td, D)
+    def process_images(self, images: Sequence[Image.Image]) -> BatchEncoding:
+        """
+        Prepare images for the InternVL processor. Returns a mapping that at least
+        contains 'pixel_values' (B, C, H, W). Any InternVL-specific extra fields
+        (tiling metadata, etc.) are passed through transparently.
+        """
+        imgs = _as_list(images)
+        out: BatchFeature = self.processor(images=imgs, return_tensors="pt")
+        if isinstance(out, dict):
+            return BatchEncoding(out)
+        return out  # already a BatchFeature
+
+    def get_n_patches(self, images: Sequence[Image.Image]) -> List[int]:
+        """
+        Estimated number of visual tokens per image. InternVL3.5 compresses to
+        ~256 visual tokens by default; if you configure a different cap in your
+        training, set `max_num_visual_tokens` accordingly in the YAML.
+
+        Returning a fixed estimate is sufficient for batching/plaid helpers.
+        """
+        n = self.max_num_visual_tokens if self.max_num_visual_tokens > 0 else 256
+        return [n] * len(_as_list(images))
+
+    def score(self, query_embed: torch.Tensor, doc_embed: torch.Tensor) -> torch.Tensor:
+        """
+        Late-interaction MaxSim (sum over query tokens of max similarity to doc tokens).
+        Shapes:
+          query_embed: (Bq, Tq, D)
+          doc_embed:   (Bd, Td, D)
+        Returns:
+          (Bq, Bd) scores
+        """
+        return self.score_multi_vector(query_embed, doc_embed)
+
+    # ---------- Public helpers (kept for backward compatibility) ----------
+    def process_queries(self, texts: Sequence[str]) -> BatchEncoding:
+        """Alias to the required method name used by some examples."""
+        return self.process_texts(texts)
+
+    # ---------- MaxSim (reference implementation if base lacks it) ----------
+    def score_multi_vector(self, query_embed: torch.Tensor, doc_embed: torch.Tensor) -> torch.Tensor:
+        # If the base class implements an optimized version, delegate to it.
         if _HAS_BASE and hasattr(super(), "score_multi_vector"):
             return super().score_multi_vector(query_embed, doc_embed)  # type: ignore[misc]
+
         # Reference MaxSim: score(i, j) = sum_t max_k <q_{i,t}, d_{j,k}>
-        # Shapes: (Bq, Tq, D), (Bd, Td, D) -> (Bq, Bd)
         q = query_embed  # (Bq, Tq, D)
         d = doc_embed    # (Bd, Td, D)
-        # Compute all pairwise token sims with broadcasting: (Bq, Bd, Tq, Td)
-        # (Bq, Tq, D) @ (Bd, Td, D)T -> (Bq, Bd, Tq, Td)
-        q_ = q[:, None, :, :]                     # (Bq, 1, Tq, D)
-        d_ = d[None, :, :, :]                     # (1, Bd, Td, D)
+        q_ = q[:, None, :, :]  # (Bq, 1, Tq, D)
+        d_ = d[None, :, :, :]  # (1, Bd, Td, D)
         sims = torch.einsum("bqtd,bdkd->bqtk", q_, d_)  # (Bq, Bd, Tq, Td)
         max_over_doc = sims.max(dim=-1).values          # (Bq, Bd, Tq)
         scores = max_over_doc.sum(dim=-1)               # (Bq, Bd)
         return scores
 
-    # Convenience (parity with other processors)
+    # Device helper for parity with other processors
     def to(self, device: torch.device | str):
-        # no registered tensors here; users generally call .to(model.device) on encodings
         return self
