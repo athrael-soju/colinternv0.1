@@ -1,11 +1,3 @@
-transformers
-einops
-timm
 accelerate
-datasets
-pillow
-mteb[vision]
-bitsandbytes
-peft
-uuid
-faiss-gpu-cu12
+transformers
+flash-attn==2.8.3

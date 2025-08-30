@@ -1,0 +1,47 @@
+config:
+  (): colpali_engine.trainer.colmodel_training.ColModelTrainingConfig
+
+  # === IO ===
+  output_dir: !path outputs/colintern-model
+
+  # === Processor ===
+  processor:
+    (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
+    class_to_instanciate: !ext colpali_engine.models.ColInternProcessor
+    # Use your local or HF path
+    pretrained_model_name_or_path: "./models/InternVL3.5-VL-4B-Instruct"
+
+  # === Model ===
+  model:
+    (): colpali_engine.utils.transformers_wrappers.AllPurposeWrapper
+    class_to_instanciate: !ext colpali_engine.models.ColIntern
+    pretrained_model_name_or_path: "./models/InternVL3.5-VL-4B-Instruct"
+    torch_dtype: !ext torch.float16  # MPS prefers fp16 for stability
+    use_cache: false
+    attn_implementation: "sdpa"
+
+  # === Data ===
+  # Either provide a train_dataset directly or a loader function.
+  # The upstream examples use a loader function; we follow that.
+  dataset_loading_func: !ext colpali_engine.utils.dataset_transformation.load_train_set
+  eval_dataset_loader: !import ../data/test_data.yaml
+
+  # === Training ===
+  run_eval: true
+  add_suffix: true
+
+  loss_func:
+    (): colpali_engine.loss.late_interaction_losses.ColbertPairwiseCELoss
+
+  tr_args: !import ../tr_args/default_tr_args.yaml
+
+  # === LoRA ===
+  peft_config:
+    (): peft.LoraConfig
+    r: 32
+    lora_alpha: 32
+    lora_dropout: 0.1
+    init_lora_weights: "gaussian"
+    bias: "none"
+    task_type: "FEATURE_EXTRACTION"
+    target_modules: ' (.*(model).*(down_proj|gate_proj|up_proj|k_proj|q_proj|v_proj|o_proj).*$|.*(custom_text_proj).*$)'
