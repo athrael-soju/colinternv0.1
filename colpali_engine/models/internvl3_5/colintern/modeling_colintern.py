@@ -62,20 +62,22 @@ class ColIntern(nn.Module):
         Mirrors HF APIs enough for AllPurposeWrapper + README examples.
         Robustly infers the text hidden_size for InternVL3.5 chat models.
         """
-        model_kwargs = dict(trust_remote_code=trust_remote_code or True)
+        model_kwargs: Dict[str, Any] = dict(trust_remote_code=trust_remote_code or True)
         if torch_dtype is not None:
             model_kwargs["torch_dtype"] = torch_dtype
         if attn_implementation is not None:
             model_kwargs["attn_implementation"] = attn_implementation
         if device_map is not None:
             model_kwargs["device_map"] = device_map
+        # default-on flash attn if caller didn't specify
+        model_kwargs.setdefault("use_flash_attn", True)
         # Pass through any extra kwargs (quantization_config, etc.)
         model_kwargs.update(kwargs)
 
         backbone = AutoModel.from_pretrained(pretrained_model_name_or_path, **model_kwargs)
 
         # --- Infer hidden size robustly ---
-        hidden_size = None
+        hidden_size: Optional[int] = None
         cfg = getattr(backbone, "config", None)
 
         def _maybe_int(x):
@@ -132,24 +134,58 @@ class ColIntern(nn.Module):
                 "Please set hidden_size manually or report the model variant."
             )
 
-        return cls(backbone=backbone, hidden_size=hidden_size, proj_dim=kwargs.pop("proj_dim", DEFAULT_EMBED_DIM))
+        return cls(
+            backbone=backbone,
+            hidden_size=hidden_size,
+            proj_dim=model_kwargs.pop("proj_dim", DEFAULT_EMBED_DIM),
+        )
 
     # -------- Internals --------
     @torch.inference_mode(False)
     def _extract_text_tokens(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **extras) -> torch.Tensor:
-        # Only forward non-text keys to the backbone (avoid duplicating input_ids/attention_mask)
+        """
+        Text path: call the inner LLM directly (InternVLChatModel.forward expects pixel_values).
+        """
+        lm = getattr(self.backbone, "language_model", None)
+        if lm is not None:
+            outputs = lm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            # CausalLM returns hidden_states; take the final layer
+            return outputs.hidden_states[-1]  # (B, T_txt, H)
+
+        # Fallback if a non-chat backbone is used
+        safe_extras = {k: v for k, v in extras.items() if k not in {"output_hidden_states", "return_dict"}}
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
-            **extras,
+            **safe_extras,
         )
-        return outputs.last_hidden_state  # (B, T_txt, H)
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            return outputs.last_hidden_state
+        return outputs.hidden_states[-1]
 
     @torch.inference_mode(False)
     def _extract_visual_tokens(self, pixel_values: torch.Tensor, **extras) -> torch.Tensor:
-        # 1) Preferred: dedicated image feature API
+        """
+        Vision path: use the chat model's `vision_model`; drop CLS for patch-only features.
+        """
+        vm = getattr(self.backbone, "vision_model", None) or getattr(getattr(self.backbone, "model", None), "vision_model", None)
+        if vm is not None:
+            out = vm(pixel_values=pixel_values, output_hidden_states=True, return_dict=True, **extras)
+            cfg = getattr(self.backbone, "config", None)
+            select_layer = getattr(cfg, "select_layer", -1) if cfg is not None else -1
+            hidden = out.last_hidden_state if select_layer == -1 else out.hidden_states[select_layer]
+            # drop CLS token: (B, N+1, H) -> (B, N, H)
+            hidden = hidden[:, 1:, :]
+            return hidden  # (B, T_vis, H)
+
+        # 1) Some remotes expose a dedicated image feature API
         if hasattr(self.backbone, "get_image_features"):
             out = self.backbone.get_image_features(
                 pixel_values=pixel_values,
@@ -163,8 +199,7 @@ class ColIntern(nn.Module):
                 return out
 
         # 2) Many remotes expose a .vision_tower module
-        vt = getattr(self.backbone, "vision_tower", None) \
-             or getattr(getattr(self.backbone, "model", None), "vision_tower", None)
+        vt = getattr(self.backbone, "vision_tower", None) or getattr(getattr(self.backbone, "model", None), "vision_tower", None)
         if vt is not None:
             out = vt(pixel_values, output_hidden_states=True, return_dict=True, **extras)
             if hasattr(out, "last_hidden_state"):
@@ -179,8 +214,7 @@ class ColIntern(nn.Module):
                 return out.last_hidden_state
 
         raise NotImplementedError(
-            "ColIntern: could not extract visual tokens. "
-            "Check your InternVL3.5 checkpoint; try .get_image_features or .vision_tower."
+            "ColIntern: could not extract visual tokens. Expected `vision_model` on InternVL chat checkpoints."
         )
 
     # -------- Forward (unified) --------
@@ -192,17 +226,19 @@ class ColIntern(nn.Module):
 
         Returns a (B, T, D) tensor of L2-normalized token embeddings.
         """
+        # avoid double-passing framework flags
+        def _sanitize(d: Dict[str, Any]) -> Dict[str, Any]:
+            return {k: v for k, v in d.items() if k not in {"input_ids", "attention_mask", "pixel_values", "output_hidden_states", "return_dict"}}
+
         if "pixel_values" in inputs:
             pixel_values = inputs["pixel_values"]
-            # Filter out keys that do not belong to the vision path
-            extras = {k: v for k, v in inputs.items() if k not in {"pixel_values", "input_ids", "attention_mask"}}
+            extras = _sanitize(inputs)
             hidden = self._extract_visual_tokens(pixel_values=pixel_values, **extras)
             proj = self.custom_vision_proj(hidden)
         else:
             input_ids = inputs["input_ids"]
             attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
-            # Filter out the text keys so we don't pass them twice
-            extras = {k: v for k, v in inputs.items() if k not in {"input_ids", "attention_mask", "pixel_values"}}
+            extras = _sanitize(inputs)
             hidden = self._extract_text_tokens(input_ids=input_ids, attention_mask=attention_mask, **extras)
             proj = self.custom_text_proj(hidden)
 

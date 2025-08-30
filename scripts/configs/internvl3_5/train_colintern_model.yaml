@@ -1,3 +1,4 @@
+# scripts/configs/internvl3_5/train_colintern_model.yaml
 config:
   (): colpali_engine.trainer.colmodel_training.ColModelTrainingConfig
 
@@ -27,6 +28,7 @@ config:
     torch_dtype: !ext torch.bfloat16
     attn_implementation: "flash_attention_2"
     device_map: "auto"
+    use_flash_attn: true             # <— important for InternVL3.5
 
   # === Training ===
   train_dataset:

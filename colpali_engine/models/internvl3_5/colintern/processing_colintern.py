@@ -1,3 +1,4 @@
+# colpali_engine/models/colintern_processor.py
 from __future__ import annotations
 from typing import Any, Iterable, List, Sequence, Union
 
