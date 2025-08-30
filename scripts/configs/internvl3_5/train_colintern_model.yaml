@@ -24,10 +24,10 @@ config:
     device_map: "auto"   # ensures FA2 loads on GPU at init
 
   # === Training ===
-  train_dataset: 
-    (): colpali_engine.utils.dataset_transformation.load_train_set  
+  train_dataset:
+    (): colpali_engine.utils.dataset_transformation.load_train_set
+    dataset_path: "vidore/colpali_train_set"
   run_eval: false        # skip legacy eval; use MTEB/ViDoRe after training
-  add_suffix: true
 
   loss_func:
     (): colpali_engine.loss.late_interaction_losses.ColbertPairwiseCELoss
