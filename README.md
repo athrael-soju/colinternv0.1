@@ -12,7 +12,6 @@ Repository contents
 - `colpali_engine/models/internvl3_5/colintern/modeling_colintern.py`
 - `colpali_engine/models/internvl3_5/colintern/processing_colintern.py`
 - `scripts/configs/internvl3_5/train_colintern_model.yaml`
-- `scripts/configs/internvl3_5/train_colintern_model_mps.yaml`
 
 Prerequisites
 -------------
@@ -39,6 +38,19 @@ python -m venv .venv
 source .venv/Scripts/activate  # Windows PowerShell: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+Data setup (local caching)
+--------------------------
+We recommend caching the training dataset locally under `data_dir/` and enabling local mode so loaders use your disk instead of remote.
+
+1) Download and save `vidore/colpali_train_set` to `data_dir/colpali_train_set`:
+
+```python
+git lfs install
+git clone https://huggingface.co/datasets/vidore/colpali_train_set
+```
+
+2) Enable local dataset usage by setting `USE_LOCAL_DATASET=1` in `colpali/.env.local`:
 
 Integration with illuin-tech/colpali
 ------------------------------------
