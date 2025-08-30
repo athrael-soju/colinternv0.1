@@ -21,18 +21,12 @@ config:
     torch_dtype: !ext torch.bfloat16
     trust_remote_code: true
     attn_implementation: "flash_attention_2"
-    device_map: "auto"
-
-  # === Data ===
-  dataset_loading_func: !ext colpali_engine.utils.dataset_transformation.load_train_set
+    device_map: "auto"   # ensures FA2 loads on GPU at init
 
   # === Training ===
-  run_eval: true
-  eval_dataset_loader:
-    (): colpali_engine.utils.dataset_transformation.load_eval_set
-    dataset_path: "vidore/vidore-benchmark-v2-67ae03e3924e85b36e7f53b0"
-    split: "test"
-    dataset_format: "beir"
+  train_dataset: 
+    (): colpali_engine.utils.dataset_transformation.load_train_set  
+  run_eval: false        # skip legacy eval; use MTEB/ViDoRe after training
   add_suffix: true
 
   loss_func:
@@ -42,14 +36,16 @@ config:
     (): transformers.training_args.TrainingArguments
     per_device_train_batch_size: 4
     gradient_accumulation_steps: 64
-    bf16: true                    
+    per_device_eval_batch_size: 1
+    eval_strategy: "steps"
+    eval_steps: 1000
+    logging_steps: 50
+    save_steps: 500
+    save_total_limit: 1
+    bf16: true
     tf32: true
     remove_unused_columns: false
     ddp_find_unused_parameters: false
-    logging_steps: 50
-    save_steps: 500
-    eval_strategy: "steps"
-    eval_steps: 1000
 
   # === LoRA ===
   peft_config:
